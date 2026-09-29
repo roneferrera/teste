@@ -1,5 +1,6 @@
 import os
 import re
+from collections import defaultdict
 from datetime import datetime
 import io
 import streamlit as st
@@ -17,16 +18,17 @@ st.set_page_config(
 # ==========================================
 
 class BankParsers:
+
     @staticmethod
     def _parse_date(dt_str):
         current_year = datetime.now().year
-        parts = dt_str.split("/")
+        parts = dt_str.strip().split("/")
         if len(parts) == 2:
             dt_formatted = f"{parts[0]}/{parts[1]}/{current_year}"
         elif len(parts) == 3 and len(parts[2]) == 2:
             dt_formatted = f"{parts[0]}/{parts[1]}/20{parts[2]}"
         else:
-            dt_formatted = dt_str
+            dt_formatted = dt_str.strip()
         try:
             return datetime.strptime(dt_formatted, "%d/%m/%Y")
         except ValueError:
@@ -35,7 +37,8 @@ class BankParsers:
     @staticmethod
     def _extract_initial_balance(text_lines):
         pattern_saldo = re.compile(
-            r"(?:SALDO\s+ANTERIOR|SD\s+CTA/APL|SALDO\s+INICIAL)\s*[:\.-]?\s*(-?[\d\.]+\,\d{2})",
+            r"(?:SALDO\s+ANTERIOR|SD\s+CTA/APL|SALDO\s+INICIAL)"
+            r"\s*[:\.-]?\s*(-?[\d\.]+\,\d{2})",
             re.IGNORECASE
         )
         for line in text_lines:
@@ -47,183 +50,216 @@ class BankParsers:
                     continue
         return 0.0
 
-    # ----------------------------------------------------------
-    # SANTANDER — parser baseado em coordenadas de palavras
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
+    # SANTANDER — parser híbrido: extract_words() + fallback texto puro
+    # Calibrado para o Internet Banking Empresarial Santander (PDF real)
+    # ------------------------------------------------------------------
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
         """
-        O extrato Santander Empresarial tem 5 colunas:
+        Layout do extrato Santander Empresarial (5 colunas):
             Data | Histórico | Documento | Valor | Saldo
 
-        Estratégia:
-          1. Se pdf_bytes disponível → usa extract_words() com coordenadas X
-             para separar as colunas por faixa horizontal, eliminando o
-             número do documento e o saldo da equação.
-          2. Fallback texto puro → regex que captura o nº do documento
-             explicitamente e o descarta.
+        Coordenadas X medidas no PDF real (página A4, ~595pt largura):
+            Data      :   0  –  95 pt
+            Flag(a/b) :  95  – 130 pt   → ignorada
+            Histórico : 130  – 400 pt
+            Documento : 400  – 470 pt   → ignorado
+            Valor     : 470  – 560 pt
+            Saldo     : 560  – 999 pt   → ignorado
+
+        Casos tratados:
+          1. Linha completa (data + histórico + valor na mesma linha Y)
+          2. Histórico quebrado em 2 ou 3 linhas (linhas sem data)
+          3. Flag "a/b/p" entre data e histórico
+          4. Documento com 5-6 dígitos (000000, 600013, 370992, etc.)
+          5. Valores negativos (vermelho no PDF) e positivos
         """
+
+        SKIP_TERMS = {
+            "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
+            "SALDO DISPONIVEL", "SALDO EM INVESTIMENTOS",
+            "DATA", "HISTÓRICO", "HISTORICO", "DOCUMENTO",
+            "VALOR", "SALDO", "TOTAL", "RESUMO", "PERIODO",
+            "PERÍODO", "INTERNET BANKING", "CONTA CORRENTE",
+            "AGÊNCIA", "AGENCIA", "CENTRAL DE ATENDIMENTO",
+            "SAC", "OUVIDORIA", "A - SALDO", "B - SALDO",
+            "C - SALDO", "D - SALDO", "E - SALDO", "F - SALDO",
+        }
+
+        RE_DATE_FULL  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+        RE_VALUE      = re.compile(r"^-?[\d\.]+,\d{2}$")
+        RE_FLAG       = re.compile(r"^[abp]$", re.IGNORECASE)
+
         transactions = []
 
-        # ── MODO COORDENADAS (preferencial) ────────────────────
+        # ==============================================================
+        # MODO COORDENADAS (usa pdf_bytes → extract_words)
+        # ==============================================================
         if pdf_bytes:
             try:
-                # Limites horizontais das colunas (em pontos PDF, página A4 ≈ 595pt)
-                # Ajustados empiricamente para o layout do Santander Empresarial:
-                #   Data      : x0  0  – x1 100
-                #   Histórico : x0 100 – x1 370
-                #   Documento : x0 370 – x1 450
-                #   Valor     : x0 450 – x1 530
-                #   Saldo     : x0 530 – x1 999
-                COL_DATE_X1      = 100
-                COL_HIST_X0      = 100
-                COL_HIST_X1      = 370
-                COL_DOC_X0       = 370
-                COL_DOC_X1       = 450
-                COL_VAL_X0       = 450
-                COL_VAL_X1       = 530
-
-                # Padrões de reconhecimento
-                re_date  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-                re_value = re.compile(r"^-?[\d\.]+\,\d{2}$")
-                re_doc   = re.compile(r"^\d{5,7}$")   # documento: 5-7 dígitos
+                # Limites de coluna em pontos (calibrados no PDF real)
+                X_DATE_MAX  =  95   # Data termina antes de 95pt
+                X_HIST_MIN  = 130   # Histórico começa em 130pt
+                X_HIST_MAX  = 400   # Histórico termina antes de 400pt
+                X_VAL_MIN   = 470   # Valor começa em 470pt
+                X_VAL_MAX   = 560   # Valor termina antes de 560pt
+                # Saldo: x >= 560 → ignorado
+                # Flag/Doc: 95-130 e 400-470 → ignorados
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
                         words = page.extract_words(
                             x_tolerance=3,
                             y_tolerance=3,
-                            keep_blank_chars=False
+                            keep_blank_chars=False,
+                            use_text_flow=False
                         )
                         if not words:
                             continue
 
-                        # Agrupa palavras por linha (y0 arredondado a 2pt)
-                        from collections import defaultdict
+                        # ── Agrupa palavras por linha (Y arredondado a 3pt) ──
                         lines_by_y = defaultdict(list)
                         for w in words:
-                            y_key = round(w["top"] / 2) * 2
+                            y_key = round(w["top"] / 3) * 3
                             lines_by_y[y_key].append(w)
 
-                        # Ordena linhas de cima para baixo
-                        sorted_ys = sorted(lines_by_y.keys())
+                        # Estado do lançamento em andamento
+                        pending_date = None   # "DD/MM/YYYY"
+                        pending_desc = []     # fragmentos de histórico
 
-                        # Cada entrada pendente: acumula fragmentos de histórico
-                        # até encontrar a próxima data com valor
-                        pending = None   # dict com date_obj, desc_parts
+                        def commit(val_str):
+                            nonlocal pending_date, pending_desc
+                            if not pending_date or not pending_desc:
+                                pending_date = None
+                                pending_desc = []
+                                return
+                            dt_obj = BankParsers._parse_date(pending_date)
+                            if not dt_obj:
+                                pending_date = None
+                                pending_desc = []
+                                return
+                            desc = " ".join(pending_desc).strip()
+                            if not desc or re.fullmatch(r"[\d\s/]+", desc):
+                                pending_date = None
+                                pending_desc = []
+                                return
+                            try:
+                                val = float(
+                                    val_str.replace(".", "").replace(",", ".")
+                                )
+                            except ValueError:
+                                pending_date = None
+                                pending_desc = []
+                                return
+                            transactions.append({
+                                "date_obj":    dt_obj,
+                                "amount":      val,
+                                "description": desc,
+                            })
+                            pending_date = None
+                            pending_desc = []
 
-                        def flush(p):
-                            """Finaliza entrada pendente sem valor → descarta."""
-                            pass  # sem valor = linha de saldo/cabeçalho
+                        for y in sorted(lines_by_y.keys()):
+                            row = sorted(lines_by_y[y], key=lambda w: w["x0"])
 
-                        for y in sorted_ys:
-                            row_words = sorted(lines_by_y[y], key=lambda w: w["x0"])
+                            date_tokens = []
+                            hist_tokens = []
+                            val_tokens  = []
 
-                            # Classifica cada palavra pela coluna
-                            date_words = []
-                            hist_words = []
-                            val_words  = []
-
-                            for w in row_words:
-                                x0 = w["x0"]
-                                x1 = w["x1"]
+                            for w in row:
+                                x0   = w["x0"]
                                 text = w["text"]
 
-                                if x1 <= COL_DATE_X1:
-                                    date_words.append(text)
-                                elif COL_HIST_X0 <= x0 < COL_DOC_X0:
-                                    hist_words.append(text)
-                                elif COL_DOC_X0 <= x0 < COL_VAL_X0:
-                                    pass  # coluna Documento → descartada
-                                elif COL_VAL_X0 <= x0 < COL_VAL_X1:
-                                    val_words.append(text)
-                                # Saldo (x0 >= COL_VAL_X1) → descartado
+                                if x0 < X_DATE_MAX:
+                                    date_tokens.append(text)
+                                elif X_HIST_MIN <= x0 < X_HIST_MAX:
+                                    # Ignora flag de bloqueio (a, b, p)
+                                    if not RE_FLAG.match(text):
+                                        hist_tokens.append(text)
+                                elif X_VAL_MIN <= x0 < X_VAL_MAX:
+                                    val_tokens.append(text)
+                                # else: flag, documento ou saldo → ignora
 
-                            date_str = " ".join(date_words).strip()
-                            hist_str = " ".join(hist_words).strip()
-                            val_str  = " ".join(val_words).strip()
+                            date_str = " ".join(date_tokens).strip()
+                            hist_str = " ".join(hist_tokens).strip()
+                            val_str  = " ".join(val_tokens).strip()
 
-                            has_date  = bool(re_date.match(date_str))
-                            has_value = bool(re_value.match(val_str.replace(".", "").replace(",", "X").replace("X", ",")) 
-                                            if val_str else False)
-                            # Simplificado:
-                            has_value = bool(val_str and re.match(r"^-?[\d\.]+\,\d{2}$", val_str))
+                            is_date  = bool(RE_DATE_FULL.match(date_str))
+                            is_value = bool(RE_VALUE.match(val_str)) if val_str else False
 
-                            # Ignora linhas de saldo/cabeçalho sem histórico real
-                            skip_terms = ["SALDO ANTERIOR", "SALDO DIA", "TOTAL", "RESUMO",
-                                          "Data", "Histórico", "Documento", "Valor", "Saldo"]
-                            if any(t.upper() in hist_str.upper() for t in skip_terms):
-                                pending = None
+                            # Ignora linhas de cabeçalho/rodapé/saldo
+                            hist_upper = hist_str.upper()
+                            if any(skip in hist_upper for skip in SKIP_TERMS):
+                                commit("")   # descarta pendente sem valor
                                 continue
 
-                            if has_date and hist_str:
-                                # Nova linha com data
-                                if has_value:
-                                    # Linha completa: data + histórico + valor na mesma linha
-                                    dt_obj = BankParsers._parse_date(date_str)
-                                    if dt_obj:
-                                        val = float(val_str.replace(".", "").replace(",", "."))
-                                        transactions.append({
-                                            "date_obj": dt_obj,
-                                            "amount": val,
-                                            "description": hist_str
-                                        })
-                                    pending = None
+                            # ── Máquina de estados ───────────────────────
+                            if is_date:
+                                if hist_str:
+                                    if is_value:
+                                        # Linha completa → fecha pendente e registra
+                                        commit("")
+                                        dt_obj = BankParsers._parse_date(date_str)
+                                        if dt_obj and not re.fullmatch(r"[\d\s/]+", hist_str):
+                                            try:
+                                                val = float(
+                                                    val_str.replace(".", "")
+                                                           .replace(",", ".")
+                                                )
+                                                transactions.append({
+                                                    "date_obj":    dt_obj,
+                                                    "amount":      val,
+                                                    "description": hist_str,
+                                                })
+                                            except ValueError:
+                                                pass
+                                    else:
+                                        # Histórico quebrado → inicia pendente
+                                        commit("")
+                                        pending_date = date_str
+                                        pending_desc = [hist_str]
                                 else:
-                                    # Histórico quebrado: salva pendente, valor virá depois
-                                    pending = {
-                                        "date_str": date_str,
-                                        "desc_parts": [hist_str]
-                                    }
-                            elif not has_date and hist_str and pending:
-                                # Continuação do histórico quebrado
-                                pending["desc_parts"].append(hist_str)
-                                if has_value:
-                                    # Encontrou o valor: finaliza a entrada
-                                    dt_obj = BankParsers._parse_date(pending["date_str"])
-                                    if dt_obj:
-                                        full_desc = " ".join(pending["desc_parts"])
-                                        val = float(val_str.replace(".", "").replace(",", "."))
-                                        transactions.append({
-                                            "date_obj": dt_obj,
-                                            "amount": val,
-                                            "description": full_desc
-                                        })
-                                    pending = None
-                            elif has_date and not hist_str and has_value and pending:
-                                # Valor aparece em linha separada com a data repetida
-                                dt_obj = BankParsers._parse_date(pending["date_str"])
-                                if dt_obj:
-                                    full_desc = " ".join(pending["desc_parts"])
-                                    val = float(val_str.replace(".", "").replace(",", "."))
-                                    transactions.append({
-                                        "date_obj": dt_obj,
-                                        "amount": val,
-                                        "description": full_desc
-                                    })
-                                pending = None
-                            else:
-                                if has_date:
-                                    pending = None  # linha sem histórico e sem valor → ignora
+                                    # Data sem histórico → não interrompe pendente
+                                    pass
 
-                return transactions
+                            else:  # linha sem data
+                                if hist_str and pending_date:
+                                    pending_desc.append(hist_str)
+                                    if is_value:
+                                        commit(val_str)
+                                elif is_value and pending_date and not hist_str:
+                                    # Valor em linha separada sem histórico
+                                    commit(val_str)
 
-            except Exception as e:
-                # Falha no modo coordenadas → cai no fallback
+                        # Fim da página: descarta pendente sem valor
+                        pending_date = None
+                        pending_desc = []
+
+                if transactions:
+                    return transactions
+
+            except Exception:
                 transactions = []
 
-        # ── FALLBACK: texto puro ────────────────────────────────
-        # Regex que captura o nº do documento explicitamente e o descarta:
-        # DATA  HISTÓRICO  DOCUMENTO(5-7 dígitos)  VALOR
-        re_date_start = re.compile(r"^\d{2}/\d{2}(?:/\d{2,4})?")
+        # ==============================================================
+        # FALLBACK: texto puro extraído pelo extract_text()
+        # Regex robusta que captura o documento explicitamente e descarta
+        # ==============================================================
 
         # Passo 1: merge de linhas quebradas
+        # Linha nova = começa com DD/MM/YYYY (4 dígitos no ano)
+        RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
         merged = []
-        for line in text_lines:
-            s = line.strip()
+        for raw in text_lines:
+            s = raw.strip()
             if not s:
                 continue
-            if re_date_start.match(s):
+            # Ignora linhas de cabeçalho/rodapé
+            s_upper = s.upper()
+            if any(skip in s_upper for skip in SKIP_TERMS):
+                continue
+            if RE_DATE_START.match(s):
                 merged.append(s)
             else:
                 if merged:
@@ -231,63 +267,73 @@ class BankParsers:
                 else:
                     merged.append(s)
 
-        # Passo 2: regex com documento explícito
-        # Formato: DATA  HISTÓRICO  DOC(5-7 dígitos)  VALOR
-        pat_with_doc = re.compile(
-            r"(\d{2}/\d{2}/\d{4})\s+"
-            r"(.+?)\s+"
-            r"(\d{5,7})\s+"
-            r"(-?[\d\.]+\,\d{2})",
-            re.IGNORECASE
+        # Passo 2: regex principal
+        # Formato: DATA [flag] HISTÓRICO DOCUMENTO(5-6 dígitos) VALOR [SALDO]
+        PAT_WITH_DOC = re.compile(
+            r"(\d{2}/\d{2}/\d{4})"           # data
+            r"(?:\s+[abp])?"                  # flag opcional (a, b, p)
+            r"\s+(.+?)"                       # histórico (lazy)
+            r"\s+(\d{5,6})"                   # documento (descartado)
+            r"\s+(-?[\d\.]+,\d{2})",          # valor
+            re.IGNORECASE,
         )
-        # Formato sem documento (ex: TARIFA REGISTRO TITULO 190702 -4,86)
-        pat_no_doc = re.compile(
-            r"(\d{2}/\d{2}/\d{4})\s+"
-            r"(.+?)\s+"
-            r"(-?[\d\.]+\,\d{2})$",
-            re.IGNORECASE
+        # Formato sem documento explícito (raro, mas defensivo)
+        PAT_NO_DOC = re.compile(
+            r"(\d{2}/\d{2}/\d{4})"
+            r"(?:\s+[abp])?"
+            r"\s+(.+?)"
+            r"\s+(-?[\d\.]+,\d{2})\s*$",
+            re.IGNORECASE,
         )
-
-        skip_terms = ["SALDO ANTERIOR", "SALDO DIA", "TOTAL", "RESUMO"]
 
         for line in merged:
             s = line.strip()
-            if any(t in s.upper() for t in skip_terms):
+            s_upper = s.upper()
+            if any(skip in s_upper for skip in SKIP_TERMS):
                 continue
 
-            m = pat_with_doc.search(s)
+            m = PAT_WITH_DOC.search(s)
             if m:
                 dt_str, desc, _doc, val_str = m.groups()
-                dt_obj = BankParsers._parse_date(dt_str)
-                if dt_obj:
-                    val = float(val_str.replace(".", "").replace(",", "."))
-                    transactions.append({
-                        "date_obj": dt_obj,
-                        "amount": val,
-                        "description": desc.strip()
-                    })
-                continue
-
-            m = pat_no_doc.search(s)
-            if m:
-                dt_str, desc, val_str = m.groups()
-                # Rejeita se "descrição" for só dígitos (número de doc sem valor real)
-                if re.fullmatch(r"[\d\s]+", desc.strip()):
+                desc = desc.strip()
+                if not desc or re.fullmatch(r"[\d\s/]+", desc):
                     continue
                 dt_obj = BankParsers._parse_date(dt_str)
                 if dt_obj:
-                    val = float(val_str.replace(".", "").replace(",", "."))
-                    transactions.append({
-                        "date_obj": dt_obj,
-                        "amount": val,
-                        "description": desc.strip()
-                    })
+                    try:
+                        val = float(val_str.replace(".", "").replace(",", "."))
+                        transactions.append({
+                            "date_obj":    dt_obj,
+                            "amount":      val,
+                            "description": desc,
+                        })
+                    except ValueError:
+                        pass
+                continue
+
+            m = PAT_NO_DOC.search(s)
+            if m:
+                dt_str, desc, val_str = m.groups()
+                desc = desc.strip()
+                if not desc or re.fullmatch(r"[\d\s/]+", desc):
+                    continue
+                dt_obj = BankParsers._parse_date(dt_str)
+                if dt_obj:
+                    try:
+                        val = float(val_str.replace(".", "").replace(",", "."))
+                        transactions.append({
+                            "date_obj":    dt_obj,
+                            "amount":      val,
+                            "description": desc,
+                        })
+                    except ValueError:
+                        pass
 
         return transactions
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # ITAÚ
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     @staticmethod
     def itau(text_lines):
         transactions = []
@@ -311,9 +357,9 @@ class BankParsers:
                 transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
         return transactions
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # BANCO DO BRASIL
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     @staticmethod
     def banco_do_brasil(text_lines):
         transactions = []
@@ -337,9 +383,9 @@ class BankParsers:
                 transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
         return transactions
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # BRADESCO
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     @staticmethod
     def bradesco(text_lines):
         transactions = []
@@ -363,9 +409,9 @@ class BankParsers:
                 transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
         return transactions
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # CAIXA
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     @staticmethod
     def caixas(text_lines):
         transactions = []
@@ -389,9 +435,9 @@ class BankParsers:
                 transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
         return transactions
 
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     # GENÉRICO
-    # ----------------------------------------------------------
+    # ------------------------------------------------------------------
     @staticmethod
     def generic_fallback(text_lines):
         transactions = []
@@ -416,6 +462,10 @@ class BankParsers:
         return transactions
 
 
+# ==========================================
+# MAPEAMENTO DE BANCOS
+# ==========================================
+
 BANK_MAPPING = {
     "Itaú Unibanco (341)":           (BankParsers.itau,            "341"),
     "Bradesco (237)":                 (BankParsers.bradesco,        "237"),
@@ -433,7 +483,7 @@ BANK_MAPPING = {
     "Mercado Pago (323)":             (BankParsers.generic_fallback,"323"),
 }
 
-# Bancos cujo parser aceita pdf_bytes
+# Parsers que recebem pdf_bytes além de text_lines
 BYTES_AWARE_PARSERS = {"033"}
 
 # ==========================================
@@ -441,7 +491,7 @@ BYTES_AWARE_PARSERS = {"033"}
 # ==========================================
 
 def generate_ofx(transactions, bank_code="000"):
-    now = datetime.now().strftime("%Y%m%d%H%M%S")
+    now      = datetime.now().strftime("%Y%m%d%H%M%S")
     dt_start = transactions[0]["date_obj"].strftime("%Y%m%d") if transactions else now
     dt_end   = transactions[-1]["date_obj"].strftime("%Y%m%d") if transactions else now
 
@@ -506,12 +556,22 @@ NEWFILEDAREA:NONE
 # 3. INTERFACE STREAMLIT
 # ==========================================
 
+def fmt_brl(v):
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 st.title("🏦 Conversor de Extrato PDF para OFX")
-st.write("Selecione o banco, faça o upload do PDF e visualize o resumo financeiro.")
+st.write(
+    "Selecione o banco, faça o upload do PDF e visualize o resumo "
+    "financeiro com saldos e lançamentos formatados."
+)
 
 col1, col2 = st.columns([2, 1])
 with col1:
-    bank_selected = st.selectbox("Selecione o Leiaute do Banco:", options=list(BANK_MAPPING.keys()))
+    bank_selected = st.selectbox(
+        "Selecione o Leiaute do Banco:",
+        options=list(BANK_MAPPING.keys())
+    )
 with col2:
     manual_initial_balance = st.number_input(
         "Saldo Inicial da Conta (R$):",
@@ -519,17 +579,17 @@ with col2:
         help="Informe o saldo anterior caso o PDF não o contenha."
     )
 
-uploaded_file = st.file_uploader("Selecione o arquivo PDF do extrato", type=["pdf"])
+uploaded_file = st.file_uploader(
+    "Selecione o arquivo PDF do extrato", type=["pdf"]
+)
 
 if uploaded_file is not None:
     if st.button("Converter para OFX e Exibir Extrato", type="primary"):
         parser_func, bank_code = BANK_MAPPING[bank_selected]
 
         try:
-            # Lê os bytes uma única vez
             pdf_bytes = uploaded_file.read()
 
-            # Extrai texto (usado por todos os parsers como base)
             text_lines = []
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for page in pdf.pages:
@@ -537,7 +597,6 @@ if uploaded_file is not None:
                     if text:
                         text_lines.extend(text.split("\n"))
 
-            # Chama o parser — parsers "bytes-aware" recebem pdf_bytes
             if bank_code in BYTES_AWARE_PARSERS:
                 transactions = parser_func(text_lines, pdf_bytes=pdf_bytes)
             else:
@@ -545,31 +604,34 @@ if uploaded_file is not None:
 
             if not transactions:
                 st.error(
-                    f"Nenhum lançamento identificado com o leiaute '{bank_selected}'. "
-                    "Verifique se o PDF contém texto selecionável."
+                    f"Nenhum lançamento identificado com o leiaute "
+                    f"'{bank_selected}'. Verifique se o PDF contém "
+                    f"texto selecionável."
                 )
             else:
                 transactions.sort(key=lambda x: x["date_obj"])
 
-                pdf_initial = BankParsers._extract_initial_balance(text_lines)
-                initial_balance = manual_initial_balance if manual_initial_balance != 0.0 else pdf_initial
+                pdf_initial     = BankParsers._extract_initial_balance(text_lines)
+                initial_balance = (
+                    manual_initial_balance
+                    if manual_initial_balance != 0.0
+                    else pdf_initial
+                )
 
                 total_credits = sum(t["amount"] for t in transactions if t["amount"] > 0)
                 total_debits  = sum(t["amount"] for t in transactions if t["amount"] < 0)
                 final_balance = initial_balance + total_credits + total_debits
 
-                def fmt_brl(v):
-                    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
                 st.markdown("---")
                 st.subheader("📊 Resumo Financeiro da Conta")
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Saldo Inicial",      fmt_brl(initial_balance))
-                m2.metric("Entradas (Créditos)", fmt_brl(total_credits))
-                m3.metric("Saídas (Débitos)",    fmt_brl(abs(total_debits)))
-                m4.metric("Saldo Final",          fmt_brl(final_balance))
 
-                ofx_data = generate_ofx(transactions, bank_code)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Saldo Inicial",       fmt_brl(initial_balance))
+                m2.metric("Entradas (Créditos)",  fmt_brl(total_credits))
+                m3.metric("Saídas (Débitos)",     fmt_brl(abs(total_debits)))
+                m4.metric("Saldo Final",           fmt_brl(final_balance))
+
+                ofx_data        = generate_ofx(transactions, bank_code)
                 output_filename = os.path.splitext(uploaded_file.name)[0] + ".ofx"
 
                 st.download_button(
@@ -585,10 +647,10 @@ if uploaded_file is not None:
 
                 df = pd.DataFrame([
                     {
-                        "Data": t["date_obj"].strftime("%d/%m/%Y"),
-                        "Descrição": t["description"],
-                        "Tipo": "Entrada" if t["amount"] > 0 else "Saída",
-                        "Valor (R$)": t["amount"]
+                        "Data":       t["date_obj"].strftime("%d/%m/%Y"),
+                        "Descrição":  t["description"],
+                        "Tipo":       "Entrada" if t["amount"] > 0 else "Saída",
+                        "Valor (R$)": t["amount"],
                     }
                     for t in transactions
                 ])
@@ -600,8 +662,9 @@ if uploaded_file is not None:
                 styled_df = (
                     df.style
                     .map(color_amount, subset=["Valor (R$)"])
-                    .format({"Valor (R$)": lambda x: fmt_brl(x)})
+                    .format({"Valor (R$)": fmt_brl})
                 )
+
                 st.dataframe(styled_df, use_container_width=True, height=400)
 
         except Exception as e:
