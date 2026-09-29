@@ -1,851 +1,608 @@
-import streamlit as st
-import pandas as pd
-from thefuzz import process, fuzz
 import os
-import io
-import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
+import io
+import streamlit as st
+import pdfplumber
+import pandas as pd
 
-st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
-st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
-st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
+st.set_page_config(
+    page_title="Conversor Extrato PDF para OFX",
+    page_icon="🏦",
+    layout="wide"
+)
 
-# ── INICIALIZAÇÃO DO ESTADO ──────────────────────────────────────────────────
-if 'de_para_map' not in st.session_state:
-    st.session_state.de_para_map = {}
-if 'balanco_processado' not in st.session_state:
-    st.session_state.balanco_processado = False
-    st.session_state.balanco_dados      = None
-    st.session_state.balanco_totais     = {}
-if 'i157_processado' not in st.session_state:
-    st.session_state.i157_processado = False
-    st.session_state.i157_dados      = None
-    st.session_state.i157_has_data   = False
-# Sugestão de conta PL — inicializa vazio; preenchido após DE/PARA estar pronto
-if 'conta_pl_sugerida'      not in st.session_state:
-    st.session_state.conta_pl_sugerida      = ""
-if 'conta_pl_sugerida_nome' not in st.session_state:
-    st.session_state.conta_pl_sugerida_nome = ""
-# Guarda a última versão do mapa usada para calcular a sugestão
-# (evita recalcular a cada rerun se o mapa não mudou)
-if '_pl_mapa_hash' not in st.session_state:
-    st.session_state._pl_mapa_hash = ""
+# ==========================================
+# 1. PARSERS ESPECÍFICOS POR BANCO
+# ==========================================
 
-# ── FUNÇÕES AUXILIARES GERAIS ────────────────────────────────────────────────
-def limpar_nome_arquivo(nome):
-    return re.sub(r'[\\/*?:"<>|]', "", nome).strip()
-
-def atualizar_manual(cod_conta):
-    chave = f"in_{cod_conta}"
-    if chave in st.session_state and st.session_state[chave]:
-        st.session_state.de_para_map[str(cod_conta)] = str(st.session_state[chave])
-
-def format_moeda(valor):
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-def ler_arquivo_texto_seguro(file):
-    raw = file.getvalue()
-    try:    content = raw.decode("latin-1")
-    except: content = raw.decode("cp1252", errors="ignore")
-    return [l.strip('\r\n') for l in content.splitlines() if l.strip()]
-
-# ── HELPERS PORTADOS DO CONVERSOR UNIFICADO ──────────────────────────────────
-def _str2float(v) -> float:
-    if isinstance(v, (int, float)): return float(v)
-    v = str(v).strip()
-    if "." in v and "," in v:
-        if v.index(".") < v.index(","): v = v.replace(".", "").replace(",", ".")
-        else:                            v = v.replace(",", "")
-    elif "," in v: v = v.replace(",", ".")
-    try:    return float(v)
-    except: return 0.0
-
-def _fmt_valor_balanco(valor: float) -> str:
-    return f"{valor:.2f}".replace(".", ",")
-
-def _calcular_resultado_liquido_i355(saldos_i355: dict) -> tuple:
-    """Retorna (valor_absoluto_float, ind_dc) onde C=superávit, D=déficit."""
-    total_rec = sum(v for v, dc in saldos_i355.values() if dc == "C")
-    total_des = sum(v for v, dc in saldos_i355.values() if dc == "D")
-    resultado  = round(total_rec - total_des, 2)
-    return (resultado, "C") if resultado >= 0 else (abs(resultado), "D")
-
-# ── SUGESTÃO DE CONTA PL COM DE/PARA ────────────────────────────────────────
-_PALAVRAS_PL_ALTA  = ("LUCRO", "PREJUIZO", "PREJUÍZO", "SUPERAVIT",
-                       "SUPERÁVIT", "DEFICIT", "DÉFICIT")
-_PALAVRAS_PL_MEDIA = ("RESULTADO", "SOBRA", "PERDA", "SURPLUS")
-
-def _sugerir_conta_pl_com_depara(
-        map_final: dict,          # cod_antigo → cod_novo  (DE/PARA já realizado)
-        final_balances: dict,     # cod_antigo → (val_str, dc)  do I155
-        saldos_i355: dict,        # cod_antigo → (float, dc)
-        df_novo: pd.DataFrame,    # plano de contas destino com cols Código, Nome, Classificação
-) -> tuple:
-    """
-    Sugere a conta de PL/Resultado usando o código DESTINO (após DE/PARA).
-
-    Critérios (em ordem de prioridade):
-      1. Conta cujo nome no plano destino contém palavra de alta prioridade
-         (LUCRO, PREJUIZO, SUPERAVIT, DEFICIT …)
-      2. Dentro das candidatas, prefere a que tem saldo >= resultado_líquido
-      3. Entre empatadas, a de maior saldo absoluto
-
-    Retorna (cod_novo_sugerido, nome_no_plano_novo) ou ("", "").
-    """
-    if not map_final or not final_balances:
-        return "", ""
-
-    res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-
-    # Monta dicionário: cod_novo → (saldo_float, dc, nome_no_plano_novo)
-    df_idx = df_novo.set_index("Código")   # índice = código reduzido (destino)
-
-    candidatas = []
-    for cod_ant, cod_nov in map_final.items():
-        cod_nov = str(cod_nov).strip().replace("|", "")
-        if not cod_nov:
-            continue
-
-        # Saldo no I155 para este código antigo
-        val_str, dc = final_balances.get(cod_ant, ("0,00", "D"))
-        saldo = _str2float(val_str)
-        if saldo <= 0:
-            continue
-
-        # Nome no plano destino
-        if cod_nov not in df_idx.index:
-            continue
-        nome_nov = str(df_idx.loc[cod_nov, "Nome"]).upper()
-
-        # Classifica prioridade pelo nome
-        if any(p in nome_nov for p in _PALAVRAS_PL_ALTA):
-            prioridade = 0
-        elif any(p in nome_nov for p in _PALAVRAS_PL_MEDIA):
-            prioridade = 1
+class BankParsers:
+    @staticmethod
+    def _parse_date(dt_str):
+        current_year = datetime.now().year
+        parts = dt_str.split("/")
+        if len(parts) == 2:
+            dt_formatted = f"{parts[0]}/{parts[1]}/{current_year}"
+        elif len(parts) == 3 and len(parts[2]) == 2:
+            dt_formatted = f"{parts[0]}/{parts[1]}/20{parts[2]}"
         else:
-            continue   # não é conta de PL/resultado — ignora
-
-        # Tem saldo suficiente para absorver o resultado?
-        saldo_suficiente = saldo >= res_liq - 0.005
-
-        candidatas.append({
-            "cod_nov":         cod_nov,
-            "nome":            df_idx.loc[cod_nov, "Nome"],
-            "saldo":           saldo,
-            "dc":              dc,
-            "prioridade":      prioridade,
-            "saldo_suficiente":saldo_suficiente,
-        })
-
-    if not candidatas:
-        return "", ""
-
-    # Ordena: prioridade (0=alta), depois saldo_suficiente desc, depois saldo desc
-    candidatas.sort(key=lambda c: (
-        c["prioridade"],
-        0 if c["saldo_suficiente"] else 1,
-        -c["saldo"],
-    ))
-
-    melhor = candidatas[0]
-    return melhor["cod_nov"], melhor["nome"]
-
-# ── SIDEBAR ──────────────────────────────────────────────────────────────────
-st.sidebar.header("Configurações")
-file_sped    = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao  = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSÃO?", value=True)
-
-# ── CARREGAMENTO DO PLANO ────────────────────────────────────────────────────
-df_novo = None
-if usar_padrao:
-    caminho_padrao = "plano_padrao.xlsx"
-    if os.path.exists(caminho_padrao):
+            dt_formatted = dt_str
         try:
-            df_novo = pd.read_excel(caminho_padrao, header=None).iloc[:, [0, 1, 2]]
-            df_novo.columns = ['Código', 'Classificação', 'Nome']
-        except:
-            st.sidebar.error("Erro ao ler plano_padrao.xlsx")
-    else:
-        st.sidebar.warning("Arquivo 'plano_padrao.xlsx' não encontrado.")
-else:
-    file_excel = st.sidebar.file_uploader("2. Subir Novo Plano (Excel)", type=["xlsx"])
-    with st.sidebar.expander("ℹ️ Ver Modelo / Baixar Exemplo"):
-        st.write("Seu Excel deve seguir estritamente esta ordem (sem cabeçalho):")
-        df_exemplo_visual = pd.DataFrame({
-            "Coluna A": ["50", "51", "..."],
-            "Coluna B": ["1.01.01", "1.01.02", "..."],
-            "Coluna C": ["CAIXA GERAL", "BANCO CONTA MOV.", "..."]
-        })
-        st.table(df_exemplo_visual)
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            pd.DataFrame(columns=['A', 'B', 'C']).to_excel(
-                writer, sheet_name='Plan1', header=False, index=False)
-        st.download_button("⬇️ Baixar Planilha Modelo", buffer,
-                           "Modelo_Plano_Contas.xlsx", "application/vnd.ms-excel")
-    if file_excel:
-        df_novo = pd.read_excel(file_excel, header=None).iloc[:, [0, 1, 2]]
-        df_novo.columns = ['Código', 'Classificação', 'Nome']
+            return datetime.strptime(dt_formatted, "%d/%m/%Y")
+        except ValueError:
+            return None
 
-# ── BACKUP ───────────────────────────────────────────────────────────────────
-st.sidebar.divider()
-st.sidebar.header("💾 Backup do Trabalho")
-arquivo_backup = st.sidebar.file_uploader(
-    "Carregar Progresso Salvo (.json)", type=["json"], key="backup_upload")
-if arquivo_backup is not None:
-    try:
-        file_id = f"{arquivo_backup.name}_{arquivo_backup.size}"
-        if st.session_state.get("backup_id") != file_id:
-            dados = json.load(arquivo_backup)
-            dados_limpos = {str(k): str(v) for k, v in dados.items()}
-            st.session_state.de_para_map.update(dados_limpos)
-            for cod, val in dados_limpos.items():
-                st.session_state[f"in_{cod}"] = val
-            st.session_state["backup_id"] = file_id
-            st.sidebar.success(f"Backup carregado! {len(dados_limpos)} contas.")
-            st.rerun()
-    except Exception as e:
-        st.sidebar.error(f"Erro no backup: {e}")
+    @staticmethod
+    def _extract_initial_balance(text_lines):
+        pattern_saldo = re.compile(
+            r"(?:SALDO\s+ANTERIOR|SD\s+CTA/APL|SALDO\s+INICIAL)\s*[:\.-]?\s*(-?[\d\.]+\,\d{2})",
+            re.IGNORECASE
+        )
+        for line in text_lines:
+            match = pattern_saldo.search(line.strip())
+            if match:
+                try:
+                    return float(match.group(1).replace(".", "").replace(",", "."))
+                except ValueError:
+                    continue
+        return 0.0
 
-placeholder_botao_salvar = st.sidebar.empty()
+    # ----------------------------------------------------------
+    # SANTANDER — parser baseado em coordenadas de palavras
+    # ----------------------------------------------------------
+    @staticmethod
+    def santander(text_lines, pdf_bytes=None):
+        """
+        O extrato Santander Empresarial tem 5 colunas:
+            Data | Histórico | Documento | Valor | Saldo
 
-# ── FILTROS ──────────────────────────────────────────────────────────────────
-st.sidebar.divider()
-st.sidebar.header("Filtros de Tela")
-ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=False)
+        Estratégia:
+          1. Se pdf_bytes disponível → usa extract_words() com coordenadas X
+             para separar as colunas por faixa horizontal, eliminando o
+             número do documento e o saldo da equação.
+          2. Fallback texto puro → regex que captura o nº do documento
+             explicitamente e o descarta.
+        """
+        transactions = []
 
-# ═════════════════════════════════════════════════════════════════════════════
-# LÓGICA PRINCIPAL
-# ═════════════════════════════════════════════════════════════════════════════
-if file_sped and df_novo is not None:
-    df_novo = df_novo.astype(str)
-    df_novo['Display'] = (df_novo['Código'] + " | " +
-                          df_novo['Classificação'] + " - " + df_novo['Nome'])
-    df_novo['Grupo'] = df_novo['Classificação'].str[0]
+        # ── MODO COORDENADAS (preferencial) ────────────────────
+        if pdf_bytes:
+            try:
+                # Limites horizontais das colunas (em pontos PDF, página A4 ≈ 595pt)
+                # Ajustados empiricamente para o layout do Santander Empresarial:
+                #   Data      : x0  0  – x1 100
+                #   Histórico : x0 100 – x1 370
+                #   Documento : x0 370 – x1 450
+                #   Valor     : x0 450 – x1 530
+                #   Saldo     : x0 530 – x1 999
+                COL_DATE_X1      = 100
+                COL_HIST_X0      = 100
+                COL_HIST_X1      = 370
+                COL_DOC_X0       = 370
+                COL_DOC_X1       = 450
+                COL_VAL_X0       = 450
+                COL_VAL_X1       = 530
 
-    content_sped = ler_arquivo_texto_seguro(file_sped)
+                # Padrões de reconhecimento
+                re_date  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+                re_value = re.compile(r"^-?[\d\.]+\,\d{2}$")
+                re_doc   = re.compile(r"^\d{5,7}$")   # documento: 5-7 dígitos
 
-    # ── CABEÇALHO 0000 ───────────────────────────────────────────────────────
-    nome_empresa   = "EMPRESA"
-    dt_inicial_sped = None
-    dt_final_sped   = None
-    for line in content_sped:
-        if line.startswith("|0000|"):
-            parts = line.split("|")
-            if len(parts) > 5: nome_empresa = limpar_nome_arquivo(parts[5])
-            try:    dt_inicial_sped = datetime.strptime(parts[3], "%d%m%Y").date()
-            except: pass
-            try:    dt_final_sped   = datetime.strptime(parts[4], "%d%m%Y").date()
-            except: pass
-            break
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    for page in pdf.pages:
+                        words = page.extract_words(
+                            x_tolerance=3,
+                            y_tolerance=3,
+                            keep_blank_chars=False
+                        )
+                        if not words:
+                            continue
 
-    # ── SALDOS I155 (inicial e final) ────────────────────────────────────────
-    initial_balances = {}
-    final_balances   = {}
-    rtl_count_i150   = 0
-    for line in content_sped:
-        if line.startswith("|I150|"):
-            rtl_count_i150 += 1
-        elif line.startswith("|I155|"):
-            reg = line.split("|")
-            if len(reg) >= 10:
-                cod       = reg[2].strip()
-                val_ini   = reg[4].strip()
-                dc_ini    = reg[5].strip()
-                val_fin   = reg[8].strip()
-                dc_fin    = reg[9].strip()
-                if cod not in initial_balances:
-                    initial_balances[cod] = (val_ini, dc_ini) if rtl_count_i150 <= 1 \
-                                            else ("0,00", dc_ini)
-                final_balances[cod] = (val_fin, dc_fin)
+                        # Agrupa palavras por linha (y0 arredondado a 2pt)
+                        from collections import defaultdict
+                        lines_by_y = defaultdict(list)
+                        for w in words:
+                            y_key = round(w["top"] / 2) * 2
+                            lines_by_y[y_key].append(w)
 
-    # ── SALDOS I355 (receitas/despesas abertas) ───────────────────────────────
-    saldos_i355: dict = {}   # cod_cta → (valor_float, ind_dc)
-    contas_i355: set  = set()
-    for line in content_sped:
-        if line.startswith("|I355|"):
-            reg = line.split("|")
-            if len(reg) >= 6:
-                cod_cta = reg[2].strip()
-                vl_str  = reg[4].strip()
-                ind_dc  = reg[5].strip().upper()
-                if not cod_cta: continue
-                if ind_dc not in ("D", "C"): ind_dc = "D"
-                saldos_i355[cod_cta] = (_str2float(vl_str), ind_dc)
-                contas_i355.add(cod_cta)
+                        # Ordena linhas de cima para baixo
+                        sorted_ys = sorted(lines_by_y.keys())
 
-    # ── CONTAS COM MOVIMENTO ─────────────────────────────────────────────────
-    contas_com_movimento = set()
-    for line in content_sped:
-        if line.startswith("|I250|"):
-            reg = line.split("|")
-            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
-        elif line.startswith("|I155|"):
-            reg = line.split("|")
-            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
+                        # Cada entrada pendente: acumula fragmentos de histórico
+                        # até encontrar a próxima data com valor
+                        pending = None   # dict com date_obj, desc_parts
 
-    # ── I050 → contas de origem ───────────────────────────────────────────────
-    contas_origem_data = []
-    for line in content_sped:
-        if line.startswith("|I050|"):
-            reg = line.split("|")
-            if len(reg) > 6:
-                cod_cta_fixo = reg[6].strip()
-                if cod_cta_fixo in contas_com_movimento:
-                    nome_conta = "Sem Nome"
-                    for j in range(7, len(reg)):
-                        if len(reg[j].strip()) > 2 and not reg[j].replace(".", "").isnumeric():
-                            nome_conta = reg[j].strip()
-                            break
-                    contas_origem_data.append({
-                        "cod":    cod_cta_fixo,
-                        "classif":reg[6].strip(),
-                        "nome":   nome_conta,
-                        "grupo":  reg[6][0] if reg[6] else ""
+                        def flush(p):
+                            """Finaliza entrada pendente sem valor → descarta."""
+                            pass  # sem valor = linha de saldo/cabeçalho
+
+                        for y in sorted_ys:
+                            row_words = sorted(lines_by_y[y], key=lambda w: w["x0"])
+
+                            # Classifica cada palavra pela coluna
+                            date_words = []
+                            hist_words = []
+                            val_words  = []
+
+                            for w in row_words:
+                                x0 = w["x0"]
+                                x1 = w["x1"]
+                                text = w["text"]
+
+                                if x1 <= COL_DATE_X1:
+                                    date_words.append(text)
+                                elif COL_HIST_X0 <= x0 < COL_DOC_X0:
+                                    hist_words.append(text)
+                                elif COL_DOC_X0 <= x0 < COL_VAL_X0:
+                                    pass  # coluna Documento → descartada
+                                elif COL_VAL_X0 <= x0 < COL_VAL_X1:
+                                    val_words.append(text)
+                                # Saldo (x0 >= COL_VAL_X1) → descartado
+
+                            date_str = " ".join(date_words).strip()
+                            hist_str = " ".join(hist_words).strip()
+                            val_str  = " ".join(val_words).strip()
+
+                            has_date  = bool(re_date.match(date_str))
+                            has_value = bool(re_value.match(val_str.replace(".", "").replace(",", "X").replace("X", ",")) 
+                                            if val_str else False)
+                            # Simplificado:
+                            has_value = bool(val_str and re.match(r"^-?[\d\.]+\,\d{2}$", val_str))
+
+                            # Ignora linhas de saldo/cabeçalho sem histórico real
+                            skip_terms = ["SALDO ANTERIOR", "SALDO DIA", "TOTAL", "RESUMO",
+                                          "Data", "Histórico", "Documento", "Valor", "Saldo"]
+                            if any(t.upper() in hist_str.upper() for t in skip_terms):
+                                pending = None
+                                continue
+
+                            if has_date and hist_str:
+                                # Nova linha com data
+                                if has_value:
+                                    # Linha completa: data + histórico + valor na mesma linha
+                                    dt_obj = BankParsers._parse_date(date_str)
+                                    if dt_obj:
+                                        val = float(val_str.replace(".", "").replace(",", "."))
+                                        transactions.append({
+                                            "date_obj": dt_obj,
+                                            "amount": val,
+                                            "description": hist_str
+                                        })
+                                    pending = None
+                                else:
+                                    # Histórico quebrado: salva pendente, valor virá depois
+                                    pending = {
+                                        "date_str": date_str,
+                                        "desc_parts": [hist_str]
+                                    }
+                            elif not has_date and hist_str and pending:
+                                # Continuação do histórico quebrado
+                                pending["desc_parts"].append(hist_str)
+                                if has_value:
+                                    # Encontrou o valor: finaliza a entrada
+                                    dt_obj = BankParsers._parse_date(pending["date_str"])
+                                    if dt_obj:
+                                        full_desc = " ".join(pending["desc_parts"])
+                                        val = float(val_str.replace(".", "").replace(",", "."))
+                                        transactions.append({
+                                            "date_obj": dt_obj,
+                                            "amount": val,
+                                            "description": full_desc
+                                        })
+                                    pending = None
+                            elif has_date and not hist_str and has_value and pending:
+                                # Valor aparece em linha separada com a data repetida
+                                dt_obj = BankParsers._parse_date(pending["date_str"])
+                                if dt_obj:
+                                    full_desc = " ".join(pending["desc_parts"])
+                                    val = float(val_str.replace(".", "").replace(",", "."))
+                                    transactions.append({
+                                        "date_obj": dt_obj,
+                                        "amount": val,
+                                        "description": full_desc
+                                    })
+                                pending = None
+                            else:
+                                if has_date:
+                                    pending = None  # linha sem histórico e sem valor → ignora
+
+                return transactions
+
+            except Exception as e:
+                # Falha no modo coordenadas → cai no fallback
+                transactions = []
+
+        # ── FALLBACK: texto puro ────────────────────────────────
+        # Regex que captura o nº do documento explicitamente e o descarta:
+        # DATA  HISTÓRICO  DOCUMENTO(5-7 dígitos)  VALOR
+        re_date_start = re.compile(r"^\d{2}/\d{2}(?:/\d{2,4})?")
+
+        # Passo 1: merge de linhas quebradas
+        merged = []
+        for line in text_lines:
+            s = line.strip()
+            if not s:
+                continue
+            if re_date_start.match(s):
+                merged.append(s)
+            else:
+                if merged:
+                    merged[-1] += " " + s
+                else:
+                    merged.append(s)
+
+        # Passo 2: regex com documento explícito
+        # Formato: DATA  HISTÓRICO  DOC(5-7 dígitos)  VALOR
+        pat_with_doc = re.compile(
+            r"(\d{2}/\d{2}/\d{4})\s+"
+            r"(.+?)\s+"
+            r"(\d{5,7})\s+"
+            r"(-?[\d\.]+\,\d{2})",
+            re.IGNORECASE
+        )
+        # Formato sem documento (ex: TARIFA REGISTRO TITULO 190702 -4,86)
+        pat_no_doc = re.compile(
+            r"(\d{2}/\d{2}/\d{4})\s+"
+            r"(.+?)\s+"
+            r"(-?[\d\.]+\,\d{2})$",
+            re.IGNORECASE
+        )
+
+        skip_terms = ["SALDO ANTERIOR", "SALDO DIA", "TOTAL", "RESUMO"]
+
+        for line in merged:
+            s = line.strip()
+            if any(t in s.upper() for t in skip_terms):
+                continue
+
+            m = pat_with_doc.search(s)
+            if m:
+                dt_str, desc, _doc, val_str = m.groups()
+                dt_obj = BankParsers._parse_date(dt_str)
+                if dt_obj:
+                    val = float(val_str.replace(".", "").replace(",", "."))
+                    transactions.append({
+                        "date_obj": dt_obj,
+                        "amount": val,
+                        "description": desc.strip()
+                    })
+                continue
+
+            m = pat_no_doc.search(s)
+            if m:
+                dt_str, desc, val_str = m.groups()
+                # Rejeita se "descrição" for só dígitos (número de doc sem valor real)
+                if re.fullmatch(r"[\d\s]+", desc.strip()):
+                    continue
+                dt_obj = BankParsers._parse_date(dt_str)
+                if dt_obj:
+                    val = float(val_str.replace(".", "").replace(",", "."))
+                    transactions.append({
+                        "date_obj": dt_obj,
+                        "amount": val,
+                        "description": desc.strip()
                     })
 
-    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=['cod'])
+        return transactions
 
-    if not df_origem.empty:
+    # ----------------------------------------------------------
+    # ITAÚ
+    # ----------------------------------------------------------
+    @staticmethod
+    def itau(text_lines):
+        transactions = []
+        pattern = re.compile(
+            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s+(.+?)\s+(-?[\d\.]+\,\d{2})\s*([CD])?",
+            re.IGNORECASE
+        )
+        for line in text_lines:
+            s = line.strip()
+            if any(t in s.upper() for t in ["SALDO DA CONTA", "SD CTA/APL", "SALDO ANTERIOR"]):
+                continue
+            m = pattern.search(s)
+            if m:
+                dt_str, desc, val_str, tp = m.groups()
+                dt_obj = BankParsers._parse_date(dt_str)
+                if not dt_obj:
+                    continue
+                val = float(val_str.replace(".", "").replace(",", "."))
+                if tp:
+                    val = -abs(val) if tp.upper() == "D" else abs(val)
+                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+        return transactions
 
-        # ── MAPEAMENTO / SCORES ───────────────────────────────────────────────
-        total_mapeadas_count    = 0
-        map_final_para_geracao  = st.session_state.de_para_map.copy()
-        process_data            = []
+    # ----------------------------------------------------------
+    # BANCO DO BRASIL
+    # ----------------------------------------------------------
+    @staticmethod
+    def banco_do_brasil(text_lines):
+        transactions = []
+        pattern = re.compile(
+            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s+(.+?)\s+([\d\.]+\,\d{2})\s*([CD])",
+            re.IGNORECASE
+        )
+        for line in text_lines:
+            s = line.strip()
+            if any(t in s.upper() for t in ["SALDO ANTERIOR", "S A L D O", "RESUMO"]):
+                continue
+            m = pattern.search(s)
+            if m:
+                dt_str, desc, val_str, tp = m.groups()
+                dt_obj = BankParsers._parse_date(dt_str)
+                if not dt_obj:
+                    continue
+                val = float(val_str.replace(".", "").replace(",", "."))
+                if tp.upper() == "D":
+                    val = -abs(val)
+                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+        return transactions
 
-        for idx, row in df_origem.iterrows():
-            cod_atual   = str(row['cod'])
-            grupo_atual = row['grupo']
+    # ----------------------------------------------------------
+    # BRADESCO
+    # ----------------------------------------------------------
+    @staticmethod
+    def bradesco(text_lines):
+        transactions = []
+        pattern = re.compile(
+            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s+(.+?)\s+(-?[\d\.]+\,\d{2})([\+-])?",
+            re.IGNORECASE
+        )
+        for line in text_lines:
+            s = line.strip()
+            if any(t in s.upper() for t in ["SALDO ANTERIOR", "ULTIMO SALDO"]):
+                continue
+            m = pattern.search(s)
+            if m:
+                dt_str, desc, val_str, signal = m.groups()
+                dt_obj = BankParsers._parse_date(dt_str)
+                if not dt_obj:
+                    continue
+                val = float(val_str.replace(".", "").replace(",", "."))
+                if signal == "-" or val_str.startswith("-"):
+                    val = -abs(val)
+                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+        return transactions
 
-            df_filtrado = df_novo[df_novo['Grupo'] == grupo_atual]
-            df_busca    = df_filtrado if not df_filtrado.empty else df_novo
+    # ----------------------------------------------------------
+    # CAIXA
+    # ----------------------------------------------------------
+    @staticmethod
+    def caixas(text_lines):
+        transactions = []
+        pattern = re.compile(
+            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s*(?:\d+)?\s+(.+?)\s+([\d\.]+\,\d{2})\s*([CD])",
+            re.IGNORECASE
+        )
+        for line in text_lines:
+            s = line.strip()
+            if any(t in s.upper() for t in ["SALDO ANTER", "SALDO DIA"]):
+                continue
+            m = pattern.search(s)
+            if m:
+                dt_str, desc, val_str, tp = m.groups()
+                dt_obj = BankParsers._parse_date(dt_str)
+                if not dt_obj:
+                    continue
+                val = float(val_str.replace(".", "").replace(",", "."))
+                if tp.upper() == "D":
+                    val = -abs(val)
+                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+        return transactions
 
-            if grupo_atual in ['1', '2']:
-                df_opcoes = df_filtrado if not df_filtrado.empty else df_novo
+    # ----------------------------------------------------------
+    # GENÉRICO
+    # ----------------------------------------------------------
+    @staticmethod
+    def generic_fallback(text_lines):
+        transactions = []
+        pattern = re.compile(
+            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s+(.+?)\s+(-?[\d\.]+\,\d{2})\s*([CD])?",
+            re.IGNORECASE
+        )
+        for line in text_lines:
+            s = line.strip()
+            if any(t in s.upper() for t in ["SALDO ANTERIOR", "RENDIMENTO", "TOTAL"]):
+                continue
+            m = pattern.search(s)
+            if m:
+                dt_str, desc, val_str, tp = m.groups()
+                dt_obj = BankParsers._parse_date(dt_str)
+                if not dt_obj:
+                    continue
+                val = float(val_str.replace(".", "").replace(",", "."))
+                if tp and tp.upper() == "D":
+                    val = -abs(val)
+                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+        return transactions
+
+
+BANK_MAPPING = {
+    "Itaú Unibanco (341)":           (BankParsers.itau,            "341"),
+    "Bradesco (237)":                 (BankParsers.bradesco,        "237"),
+    "Santander (033)":                (BankParsers.santander,       "033"),
+    "Banco do Brasil (001)":          (BankParsers.banco_do_brasil, "001"),
+    "Caixa Econômica Federal (104)":  (BankParsers.caixas,          "104"),
+    "Sicoob (756)":                   (BankParsers.generic_fallback,"756"),
+    "Sicredi (748)":                  (BankParsers.generic_fallback,"748"),
+    "Banco Inter (077)":              (BankParsers.generic_fallback,"077"),
+    "Nubank (260)":                   (BankParsers.generic_fallback,"260"),
+    "C6 Bank (336)":                  (BankParsers.generic_fallback,"336"),
+    "Banrisul (041)":                 (BankParsers.generic_fallback,"041"),
+    "Stone Pagamentos (197)":         (BankParsers.generic_fallback,"197"),
+    "Unicred (136)":                  (BankParsers.generic_fallback,"136"),
+    "Mercado Pago (323)":             (BankParsers.generic_fallback,"323"),
+}
+
+# Bancos cujo parser aceita pdf_bytes
+BYTES_AWARE_PARSERS = {"033"}
+
+# ==========================================
+# 2. GERADOR OFX
+# ==========================================
+
+def generate_ofx(transactions, bank_code="000"):
+    now = datetime.now().strftime("%Y%m%d%H%M%S")
+    dt_start = transactions[0]["date_obj"].strftime("%Y%m%d") if transactions else now
+    dt_end   = transactions[-1]["date_obj"].strftime("%Y%m%d") if transactions else now
+
+    ofx = f"""OFXHEADER:100
+DATA:OFXSGML
+VERSION:102
+SECURITY:NONE
+ENCODING:USASCII
+CHARSET:1252
+COMPRESSION:NONE
+OLDFILEDAREA:NONE
+NEWFILEDAREA:NONE
+
+<OFX>
+<SIGNONMSGSRSV1>
+<SONRS>
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<DTSERVER>{now}
+<LANGUAGE>POR
+</SONRS>
+</SIGNONMSGSRSV1>
+<BANKMSGSRSV1>
+<STMTTRNRS>
+<TRNUID>{now}
+<STATUS>
+<CODE>0
+<SEVERITY>INFO
+</STATUS>
+<STMTRS>
+<CURDEF>BRL</CURDEF>
+<BANKACCTFROM>
+<BANKID>{bank_code}</BANKID>
+<ACCTID>00000000</ACCTID>
+<ACCTTYPE>CHECKING</ACCTTYPE>
+</BANKACCTFROM>
+<BANKTRANLIST>
+<DTSTART>{dt_start}</DTSTART>
+<DTEND>{dt_end}</DTEND>
+"""
+    for idx, tr in enumerate(transactions):
+        tr_type = "CREDIT" if tr["amount"] > 0 else "DEBIT"
+        dt_str  = tr["date_obj"].strftime("%Y%m%d")
+        ofx += f"""<STMTTRN>
+<TRNTYPE>{tr_type}</TRNTYPE>
+<DTPOSTED>{dt_str}</DTPOSTED>
+<TRNAMT>{tr['amount']:.2f}</TRNAMT>
+<FITID>{dt_str}{idx+1:04d}</FITID>
+<MEMO>{tr['description']}</MEMO>
+</STMTTRN>
+"""
+    ofx += """</BANKTRANLIST>
+</STMTRS>
+</STMTTRNRS>
+</BANKMSGSRSV1>
+</OFX>"""
+    return ofx
+
+# ==========================================
+# 3. INTERFACE STREAMLIT
+# ==========================================
+
+st.title("🏦 Conversor de Extrato PDF para OFX")
+st.write("Selecione o banco, faça o upload do PDF e visualize o resumo financeiro.")
+
+col1, col2 = st.columns([2, 1])
+with col1:
+    bank_selected = st.selectbox("Selecione o Leiaute do Banco:", options=list(BANK_MAPPING.keys()))
+with col2:
+    manual_initial_balance = st.number_input(
+        "Saldo Inicial da Conta (R$):",
+        value=0.0, step=100.0, format="%.2f",
+        help="Informe o saldo anterior caso o PDF não o contenha."
+    )
+
+uploaded_file = st.file_uploader("Selecione o arquivo PDF do extrato", type=["pdf"])
+
+if uploaded_file is not None:
+    if st.button("Converter para OFX e Exibir Extrato", type="primary"):
+        parser_func, bank_code = BANK_MAPPING[bank_selected]
+
+        try:
+            # Lê os bytes uma única vez
+            pdf_bytes = uploaded_file.read()
+
+            # Extrai texto (usado por todos os parsers como base)
+            text_lines = []
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        text_lines.extend(text.split("\n"))
+
+            # Chama o parser — parsers "bytes-aware" recebem pdf_bytes
+            if bank_code in BYTES_AWARE_PARSERS:
+                transactions = parser_func(text_lines, pdf_bytes=pdf_bytes)
             else:
-                df_opcoes = df_novo[~df_novo['Grupo'].isin(['1', '2'])]
-                if df_opcoes.empty: df_opcoes = df_novo
+                transactions = parser_func(text_lines)
 
-            lista_nomes = df_busca['Nome'].tolist()
-            candidatos  = process.extract(row['nome'], lista_nomes,
-                                          scorer=fuzz.token_set_ratio, limit=5)
-            melhor_match = None; melhor_score = -1
-            for nome_cand, score_flex in candidatos:
-                score_rig = fuzz.token_sort_ratio(row['nome'], nome_cand)
-                media = (score_flex + score_rig) / 2
-                if media > melhor_score:
-                    melhor_score = media; melhor_match = nome_cand
-            score = int(melhor_score)
-
-            cod_sugerido_ia = None; display_sugerido_ia = None
-            if score >= 65:
-                match_row = df_busca[df_busca['Nome'] == melhor_match]
-                if not match_row.empty:
-                    cod_sugerido_ia     = match_row.iloc[0]['Código']
-                    display_sugerido_ia = match_row.iloc[0]['Display']
-
-            esta_no_mapa  = cod_atual in st.session_state.de_para_map
-            valor_no_mapa = str(st.session_state.de_para_map.get(cod_atual, ""))
-            resolvida = False; is_manual = False
-
-            if esta_no_mapa:
-                resolvida = True
-                if valor_no_mapa != cod_sugerido_ia: is_manual = True
-            elif score >= 65:
-                resolvida = True
-                map_final_para_geracao[cod_atual] = cod_sugerido_ia
-
-            if resolvida: total_mapeadas_count += 1
-
-            process_data.append({
-                "row": row, "df_busca": df_busca, "df_opcoes": df_opcoes,
-                "score": score, "cod_sugerido_ia": cod_sugerido_ia,
-                "display_sugerido_ia": display_sugerido_ia,
-                "resolvida": resolvida, "is_manual": is_manual,
-                "esta_no_mapa": esta_no_mapa, "valor_no_mapa": valor_no_mapa,
-            })
-
-        # ── SUGESTÃO DE CONTA PL (recalcula quando o mapa muda) ──────────────
-        # Usa hash do mapa para evitar recalcular a cada rerun sem mudança
-        mapa_hash_atual = str(sorted(map_final_para_geracao.items()))
-        if (saldos_i355 and
-                mapa_hash_atual != st.session_state._pl_mapa_hash):
-            sugerida, sugerida_nome = _sugerir_conta_pl_com_depara(
-                map_final_para_geracao,
-                final_balances,
-                saldos_i355,
-                df_novo,
-            )
-            st.session_state.conta_pl_sugerida      = sugerida
-            st.session_state.conta_pl_sugerida_nome = sugerida_nome
-            st.session_state._pl_mapa_hash          = mapa_hash_atual
-
-        # ── EXIBIÇÃO DO MAPEAMENTO ────────────────────────────────────────────
-        st.subheader("🔗 Mapeamento de Contas")
-
-        for item in process_data:
-            row       = item['row']
-            cod_atual = str(row['cod'])
-            resolvida = item['resolvida']
-            esta_no_mapa = item['esta_no_mapa']
-
-            if ocultar_mapeadas and resolvida: continue
-
-            with st.container():
-                col_origem, col_destino = st.columns([1, 1])
-                with col_origem:
-                    st.markdown(f"**{row['nome']}**")
-                    st.caption(f"Cod no SPED: {cod_atual} | Grupo: {row['grupo']}")
-
-                with col_destino:
-                    df_opcoes    = item['df_opcoes']
-                    opcoes       = ["-- SELECIONE --",
-                                    "📝 -- DIGITAR MANUALMENTE --"] + df_opcoes['Display'].tolist()
-                    chave_select = f"sel_{cod_atual}"
-                    valor_inicial = opcoes[0]
-
-                    if esta_no_mapa:
-                        match_row = df_novo[df_novo['Código'] == item['valor_no_mapa']]
-                        if not match_row.empty:
-                            display_str = match_row.iloc[0]['Display']
-                            if display_str not in opcoes: opcoes.insert(2, display_str)
-                            valor_inicial = display_str
-                        else:
-                            valor_inicial = "📝 -- DIGITAR MANUALMENTE --"
-                            if f"in_{cod_atual}" not in st.session_state:
-                                st.session_state[f"in_{cod_atual}"] = item['valor_no_mapa']
-                    elif item['display_sugerido_ia']:
-                        if item['display_sugerido_ia'] not in opcoes:
-                            opcoes.insert(2, item['display_sugerido_ia'])
-                        valor_inicial = (item['display_sugerido_ia']
-                                        if chave_select not in st.session_state
-                                        else st.session_state[chave_select])
-
-                    if chave_select not in st.session_state:
-                        st.session_state[chave_select] = valor_inicial
-
-                    if item['is_manual']:         st.info("📌 Mapeado Manualmente")
-                    elif item['score'] >= 65:     st.success(f"✅ Sugestão: {item['score']}%")
-                    else:                         st.warning(f"⚠️ Similaridade baixa ({item['score']}%)")
-
-                    escolha = st.selectbox(
-                        label=f"sel_{cod_atual}", options=opcoes,
-                        key=chave_select, label_visibility="collapsed"
-                    )
-
-                    novo_valor = None
-                    if escolha == "📝 -- DIGITAR MANUALMENTE --":
-                        pass
-                    elif escolha != "-- SELECIONE --":
-                        try:
-                            cod_red = escolha.split(" | ")[0]
-                            if str(cod_red) != item['valor_no_mapa']:
-                                novo_valor = str(cod_red)
-                        except: pass
-                    elif escolha == "-- SELECIONE --" and esta_no_mapa:
-                        del st.session_state.de_para_map[cod_atual]
-                        st.rerun()
-
-                    if novo_valor:
-                        st.session_state.de_para_map[cod_atual] = novo_valor
-                        st.rerun()
-
-                    if escolha == "📝 -- DIGITAR MANUALMENTE --":
-                        valor_ant = st.session_state.de_para_map.get(cod_atual, "")
-                        st.text_input(f"Cód. manual para {cod_atual}:", value=valor_ant,
-                                      key=f"in_{cod_atual}",
-                                      on_change=atualizar_manual, args=(cod_atual,))
-                st.markdown("---")
-
-        # ── MÉTRICAS ──────────────────────────────────────────────────────────
-        st.divider()
-        col_m1, col_m2, col_m3 = st.columns(3)
-        perc = (total_mapeadas_count / len(df_origem)) * 100 if len(df_origem) > 0 else 0
-        col_m1.metric("Total",    len(df_origem))
-        col_m2.metric("Mapeadas", total_mapeadas_count, f"{perc:.1f}%")
-        col_m3.metric("Pendentes",len(df_origem) - total_mapeadas_count,
-                      f"-{len(df_origem) - total_mapeadas_count}", delta_color="inverse")
-
-        # ── FINALIZAÇÃO ───────────────────────────────────────────────────────
-        st.divider()
-        st.subheader("📂 Finalização, Relatórios e Downloads")
-        col1, col2, col3, col4 = st.columns(4)
-
-        pendentes = len(df_origem) - total_mapeadas_count
-
-        # ── COL 1 — SPED AJUSTADO ─────────────────────────────────────────────
-        sped_buffer = None
-        if pendentes == 0:
-            saida = []
-            for line in content_sped:
-                if line.startswith("|9999|"):
-                    saida.append(line); break
-                if line.startswith("|I250|"):
-                    reg = line.split("|")
-                    if len(reg) > 2 and reg[2] in map_final_para_geracao:
-                        reg[2] = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
-                    saida.append("|".join(reg))
-                else:
-                    saida.append(line)
-            sped_buffer = "\r\n".join(saida).encode("latin-1", errors="replace")
-
-        with col1:
-            st.markdown("**1. Arquivo Final**")
-            if pendentes > 0:
-                st.warning(f"⚠️ Faltam {pendentes}.")
-                st.button("🚀 Gerar SPED", disabled=True)
-            else:
-                st.download_button(
-                    "💾 Baixar SPED Ajustado", data=sped_buffer,
-                    file_name=f"SPED_AJUSTADO_{nome_empresa}.txt",
-                    mime="text/plain", use_container_width=True)
-                if os.path.exists("Conjunto SPED.xml"):
-                    st.markdown("---")
-                    with open("Conjunto SPED.xml", "rb") as f:
-                        st.download_button("⬇️ Baixar Conjunto SPED (XML)",
-                                           f.read(), "Conjunto SPED.xml",
-                                           "application/xml", use_container_width=True)
-
-        # ── COL 2 — BALANÇO ───────────────────────────────────────────────────
-        with col2:
-            st.markdown("**2. Balanço (I155)**")
-
-            tipo_saldo = st.radio(
-                "Referência do Saldo:",
-                ["Inicial (Abertura)", "Final (Fechamento)"],
-                key="radio_tipo_saldo"
-            )
-
-            # ── Opções extras só para saldo FINAL ────────────────────────────
-            modo_resultado_balanco = "apenas_patrimonial"
-            conta_pl_informada     = ""
-
-            if tipo_saldo == "Final (Fechamento)":
-                tem_i355 = bool(saldos_i355)
-                st.markdown("---")
-                st.markdown("**Escopo do Balanço:**")
-
-                if tem_i355:
-                    escopo_sel = st.radio(
-                        "Escopo:",
-                        ["✅ Apenas Ativo / Passivo / PL (balanço fechado)",
-                         "📂 Ativo / Passivo / PL + Resultado (aberto — encerrar no destino)"],
-                        key="radio_escopo_balanco",
-                        label_visibility="collapsed"
-                    )
-                else:
-                    escopo_sel = "✅ Apenas Ativo / Passivo / PL (balanço fechado)"
-                    st.caption("ℹ️ Nenhum registro I355 encontrado — "
-                               "somente o modo patrimonial está disponível.")
-
-                if "Resultado" in escopo_sel:
-                    modo_resultado_balanco = "aberto_com_resultado"
-
-                    # Métricas do I355
-                    res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-                    total_rec_355   = sum(v for v, dc in saldos_i355.values() if dc == "C")
-                    total_des_355   = sum(v for v, dc in saldos_i355.values() if dc == "D")
-
-                    st.markdown("---")
-                    _c1, _c2, _c3 = st.columns(3)
-                    _c1.metric("Receitas (I355)",  format_moeda(total_rec_355))
-                    _c2.metric("Despesas (I355)",  format_moeda(total_des_355))
-                    _c3.metric(
-                        f"Resultado ({'Superávit' if dc_res == 'C' else 'Déficit'})",
-                        format_moeda(res_liq)
-                    )
-
-                    # ── Sugestão automática da conta PL ──────────────────────
-                    sugerida      = st.session_state.conta_pl_sugerida
-                    sugerida_nome = st.session_state.conta_pl_sugerida_nome
-
-                    st.markdown("---")
-                    st.markdown("**Conta de PL / Resultado (Superávit / Déficit):**")
-
-                    if sugerida:
-                        saldo_sug_str, dc_sug = final_balances.get(
-                            # tenta achar o cod_antigo que mapeia para sugerida
-                            next((k for k, v in map_final_para_geracao.items()
-                                  if str(v) == sugerida), ""),
-                            ("0,00", "?")
-                        )
-                        saldo_sug_f = _str2float(saldo_sug_str)
-
-                        suficiente = saldo_sug_f >= res_liq - 0.005
-                        badge = "✅" if suficiente else "⚠️"
-                        st.info(
-                            f"{badge} Sugestão automática: **{sugerida}** — {sugerida_nome}\n\n"
-                            f"Saldo atual: **{format_moeda(saldo_sug_f)} ({dc_sug})**  |  "
-                            f"Resultado a absorver: **{format_moeda(res_liq)}**\n\n"
-                            "Detectada pelo nome no plano destino (após DE/PARA). "
-                            "Confirme antes de processar."
-                        )
-                    else:
-                        st.warning(
-                            "⚠️ Nenhuma conta de PL/Resultado detectada automaticamente "
-                            "no plano destino. Informe o código manualmente."
-                        )
-
-                    conta_pl_informada = st.text_input(
-                        "Código da conta de Superávit/Déficit no PL (código DESTINO):",
-                        value=sugerida if sugerida else "",
-                        placeholder="Ex: 311010101",
-                        key="input_conta_pl_balanco",
-                        help=(
-                            "Use o código já convertido pelo DE/PARA. "
-                            "O valor do Resultado Líquido do I355 será deduzido desta conta "
-                            "para que Débitos = Créditos no lançamento gerado."
-                        )
-                    )
-
-                    if not conta_pl_informada:
-                        st.warning("⚠️ Informe a conta de PL/Resultado para que o balanço feche.")
-                    elif sugerida and conta_pl_informada != sugerida:
-                        st.caption(
-                            f"ℹ️ Usando conta informada: **{conta_pl_informada}** "
-                            f"(sugestão era: {sugerida})"
-                        )
-
-            # ── Data do balanço ───────────────────────────────────────────────
-            st.markdown("---")
-            data_padrao = datetime.today()
-            if tipo_saldo == "Inicial (Abertura)" and dt_inicial_sped:
-                data_padrao = dt_inicial_sped - timedelta(days=1)
-            elif tipo_saldo == "Final (Fechamento)" and dt_final_sped:
-                data_padrao = dt_final_sped
-
-            data_balanco = st.date_input(
-                "Data p/ Balanço:", data_padrao,
-                format="DD/MM/YYYY", key="date_balanco"
-            )
-            dt_fmt = data_balanco.strftime("%d/%m/%Y")
-
-            # ── Botão Processar ───────────────────────────────────────────────
-            btn_disabled = (
-                modo_resultado_balanco == "aberto_com_resultado"
-                and not conta_pl_informada.strip()
-            )
-            processar_balanco = st.button(
-                "🔍 Processar Balanço",
-                key="btn_processar_balanco",
-                disabled=btn_disabled,
-                help=("Informe a conta de PL/Resultado para habilitar."
-                      if btn_disabled else "")
-            )
-
-            if processar_balanco:
-                balanco_lines = ["|6000|V||||"]
-                total_debito  = 0.0
-                total_credito = 0.0
-                has_balanco   = False
-
-                saldos_base = (initial_balances
-                               if tipo_saldo == "Inicial (Abertura)"
-                               else final_balances)
-
-                # ── Modo 1: apenas patrimonial ────────────────────────────────
-                if modo_resultado_balanco == "apenas_patrimonial":
-                    for cod_antigo, cod_novo in map_final_para_geracao.items():
-                        cod_novo = str(cod_novo).replace("|", "")
-                        val_str, dc = saldos_base.get(cod_antigo, ("0,00", "D"))
-                        val_f = _str2float(val_str)
-                        if val_f <= 0: continue
-
-                        if dc == "D":
-                            total_debito += val_f
-                            linha = (f"|6100|{dt_fmt}|{cod_novo}||"
-                                     f"{_fmt_valor_balanco(val_f)}"
-                                     f"||SALDO DE ABERTURA EM {dt_fmt}|||||")
-                        else:
-                            total_credito += val_f
-                            linha = (f"|6100|{dt_fmt}||{cod_novo}|"
-                                     f"{_fmt_valor_balanco(val_f)}"
-                                     f"||SALDO DE ABERTURA EM {dt_fmt}|||||")
-                        balanco_lines.append(linha)
-                        has_balanco = True
-
-                # ── Modo 2: aberto com resultado ──────────────────────────────
-                else:
-                    conta_pl  = conta_pl_informada.strip()
-                    res_liq, dc_res = _calcular_resultado_liquido_i355(saldos_i355)
-
-                    # Monta saldos patrimoniais como float,
-                    # excluindo contas que aparecem no I355
-                    # A chave aqui é o cod_NOVO (destino), não o original
-                    saldos_destino: dict = {}  # cod_novo → (float, dc)
-
-                    for cod_ant, cod_nov in map_final_para_geracao.items():
-                        cod_nov = str(cod_nov).replace("|", "")
-                        if not cod_nov: continue
-                        if cod_ant in contas_i355: continue   # virá pelo I355
-
-                        val_str, dc = saldos_base.get(cod_ant, ("0,00", "D"))
-                        val_f = _str2float(val_str)
-                        saldos_destino[cod_nov] = (val_f, dc)
-
-                    # Ajusta a conta PL: retira o resultado para "reabrir" via I355
-                    if conta_pl in saldos_destino:
-                        saldo_pl, dc_pl = saldos_destino[conta_pl]
-                        if   dc_pl == "C" and dc_res == "C": novo_saldo = round(saldo_pl - res_liq, 2)
-                        elif dc_pl == "D" and dc_res == "D": novo_saldo = round(saldo_pl - res_liq, 2)
-                        elif dc_pl == "C" and dc_res == "D": novo_saldo = round(saldo_pl + res_liq, 2)
-                        else:                                 novo_saldo = round(saldo_pl + res_liq, 2)
-
-                        if novo_saldo >= 0:
-                            saldos_destino[conta_pl] = (novo_saldo, dc_pl)
-                        else:
-                            dc_inv = "D" if dc_pl == "C" else "C"
-                            saldos_destino[conta_pl] = (abs(novo_saldo), dc_inv)
-                    else:
-                        st.warning(
-                            f"⚠️ Conta PL **{conta_pl}** não encontrada nos saldos "
-                            "destino. O balanço pode não fechar."
-                        )
-
-                    # Gera linhas patrimoniais (já com código destino)
-                    for cod_nov, (val_f, dc) in saldos_destino.items():
-                        if val_f <= 0: continue
-                        val_fmt = _fmt_valor_balanco(val_f)
-                        if dc == "D":
-                            total_debito += val_f
-                            linha = (f"|6100|{dt_fmt}|{cod_nov}||{val_fmt}"
-                                     f"||SALDO DE ABERTURA EM {dt_fmt}|||||")
-                        else:
-                            total_credito += val_f
-                            linha = (f"|6100|{dt_fmt}||{cod_nov}|{val_fmt}"
-                                     f"||SALDO DE ABERTURA EM {dt_fmt}|||||")
-                        balanco_lines.append(linha)
-                        has_balanco = True
-
-                    # Gera linhas de resultado (I355) — aplica DE/PARA
-                    for cod_ant, (val_f, dc) in saldos_i355.items():
-                        if val_f <= 0: continue
-                        cod_nov = str(map_final_para_geracao.get(cod_ant, "")).replace("|", "")
-                        if not cod_nov: continue   # sem mapeamento — ignora
-                        val_fmt = _fmt_valor_balanco(val_f)
-                        if dc == "D":
-                            total_debito += val_f
-                            linha = (f"|6100|{dt_fmt}|{cod_nov}||{val_fmt}"
-                                     f"||SALDO DE ABERTURA EM {dt_fmt}|||||")
-                        else:
-                            total_credito += val_f
-                            linha = (f"|6100|{dt_fmt}||{cod_nov}|{val_fmt}"
-                                     f"||SALDO DE ABERTURA EM {dt_fmt}|||||")
-                        balanco_lines.append(linha)
-                        has_balanco = True
-
-                # ── Persiste resultado ────────────────────────────────────────
-                st.session_state.balanco_dados  = "\r\n".join(balanco_lines).encode(
-                    "latin-1", errors="replace")
-                st.session_state.balanco_totais = {
-                    "D": round(total_debito, 2),
-                    "C": round(total_credito, 2),
-                }
-                st.session_state.balanco_processado = True
-                st.session_state.balanco_has_data   = has_balanco
-                st.rerun()
-
-            # ── Exibe totais e download ───────────────────────────────────────
-            if st.session_state.balanco_processado:
-                tot  = st.session_state.balanco_totais
-                diff = round(tot["D"] - tot["C"], 2)
-                st.markdown("---")
-                st.caption(f"Débitos:  {format_moeda(tot['D'])}")
-                st.caption(f"Créditos: {format_moeda(tot['C'])}")
-                if abs(diff) > 0.01:
-                    st.error(f"Diferença: {format_moeda(diff)}")
-                else:
-                    st.success("Diferença: R$ 0,00 ✅")
-
-                if st.session_state.get('balanco_has_data') and pendentes == 0:
-                    st.download_button(
-                        "💾 Baixar Balanço",
-                        data=st.session_state.balanco_dados,
-                        file_name=f"BALANCO_{nome_empresa}_{dt_fmt.replace('/', '')}.txt",
-                        mime="text/plain", use_container_width=True
-                    )
-                elif pendentes > 0: st.warning("Resolva pendências.")
-                else:               st.warning("Sem dados.")
-
-        # ── COL 3 — I157 ──────────────────────────────────────────────────────
-        with col3:
-            st.markdown("**3. Troca de Plano (I157)**")
-            if st.button("🔄 Processar I157"):
-                i157_lines    = ["ID;;;;;;"]
-                has_i157      = False
-                i157_data_list = []
-
-                for cod_antigo in map_final_para_geracao:
-                    novo    = map_final_para_geracao[cod_antigo].replace("|", "")
-                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
-                    try:    val_float = float(val_str.replace(",", "."))
-                    except: val_float = 0.0
-                    if val_float > 0:
-                        i157_data_list.append((novo, cod_antigo, val_str, dc))
-
-                if i157_data_list:
-                    i157_data_list.sort(key=lambda x: str(x[0]))
-                    for item in i157_data_list:
-                        novo, cod_antigo, val_str, dc = item
-                        if "." in cod_antigo or not cod_antigo.isnumeric():
-                            linha = f"C;{novo};;{cod_antigo};{val_str};{dc};"
-                        else:
-                            linha = f"C;{novo};{cod_antigo};;{val_str};{dc};"
-                        i157_lines.append(linha)
-                    has_i157 = True
-
-                st.session_state.i157_dados      = "\r\n".join(i157_lines).encode(
-                    "latin-1", errors="replace")
-                st.session_state.i157_processado = True
-                st.session_state.i157_has_data   = has_i157
-                st.rerun()
-
-            if st.session_state.get('i157_processado'):
-                st.markdown("---")
-                if st.session_state.i157_has_data and pendentes == 0:
-                    st.success("✅ Arquivo I157 gerado!")
-                    st.download_button(
-                        "💾 Baixar I157",
-                        data=st.session_state.i157_dados,
-                        file_name=f"I157_Saldos_{nome_empresa}.txt",
-                        mime="text/plain", use_container_width=True
-                    )
-                    if os.path.exists("Conjunto I157.xml"):
-                        st.markdown("---")
-                        with open("Conjunto I157.xml", "rb") as f:
-                            st.download_button("⬇️ Baixar Conjunto I157 (XML)",
-                                               f.read(), "Conjunto I157.xml",
-                                               "application/xml", use_container_width=True)
-                elif pendentes > 0: st.warning("Resolva pendências.")
-                else:               st.warning("Sem dados.")
-
-        # ── COL 4 — CONFERÊNCIA ───────────────────────────────────────────────
-        with col4:
-            st.markdown("**4. Conferência**")
-            df_pend = df_origem[~df_origem['cod'].isin(map_final_para_geracao.keys())]
-            if not df_pend.empty:
-                st.warning(f"{len(df_pend)} pendentes.")
-                st.download_button(
-                    "📑 Relatório CSV",
-                    df_pend.to_csv(index=False, sep=';', encoding='utf-8-sig'),
-                    "contas_pendentes.csv", "text/csv", use_container_width=True
+            if not transactions:
+                st.error(
+                    f"Nenhum lançamento identificado com o leiaute '{bank_selected}'. "
+                    "Verifique se o PDF contém texto selecionável."
                 )
             else:
-                st.success("✅ Tudo Mapeado OK!")
+                transactions.sort(key=lambda x: x["date_obj"])
 
-    else:
-        st.error("Nenhuma conta com movimento detectada.")
+                pdf_initial = BankParsers._extract_initial_balance(text_lines)
+                initial_balance = manual_initial_balance if manual_initial_balance != 0.0 else pdf_initial
 
-# ── BOTÃO SALVAR BACKUP ───────────────────────────────────────────────────────
-if 'de_para_map' in st.session_state and len(st.session_state.de_para_map) > 0:
-    with placeholder_botao_salvar:
-        st.download_button(
-            "⬇️ Salvar Progresso Atual",
-            json.dumps(st.session_state.de_para_map, indent=4),
-            "backup_mapeamento_ecd.json", "application/json",
-            help="Baixe para continuar depois."
-        )
-else:
-    st.info("Aguardando arquivos...")
+                total_credits = sum(t["amount"] for t in transactions if t["amount"] > 0)
+                total_debits  = sum(t["amount"] for t in transactions if t["amount"] < 0)
+                final_balance = initial_balance + total_credits + total_debits
+
+                def fmt_brl(v):
+                    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+                st.markdown("---")
+                st.subheader("📊 Resumo Financeiro da Conta")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Saldo Inicial",      fmt_brl(initial_balance))
+                m2.metric("Entradas (Créditos)", fmt_brl(total_credits))
+                m3.metric("Saídas (Débitos)",    fmt_brl(abs(total_debits)))
+                m4.metric("Saldo Final",          fmt_brl(final_balance))
+
+                ofx_data = generate_ofx(transactions, bank_code)
+                output_filename = os.path.splitext(uploaded_file.name)[0] + ".ofx"
+
+                st.download_button(
+                    label="📥 Baixar Arquivo OFX Gerado",
+                    data=ofx_data,
+                    file_name=output_filename,
+                    mime="application/x-ofx",
+                    type="secondary"
+                )
+
+                st.markdown("---")
+                st.subheader("📋 Lançamentos Extrato (Ordem Cronológica)")
+
+                df = pd.DataFrame([
+                    {
+                        "Data": t["date_obj"].strftime("%d/%m/%Y"),
+                        "Descrição": t["description"],
+                        "Tipo": "Entrada" if t["amount"] > 0 else "Saída",
+                        "Valor (R$)": t["amount"]
+                    }
+                    for t in transactions
+                ])
+
+                def color_amount(val):
+                    color = "#28a745" if val > 0 else "#dc3545"
+                    return f"color: {color}; font-weight: bold;"
+
+                styled_df = (
+                    df.style
+                    .map(color_amount, subset=["Valor (R$)"])
+                    .format({"Valor (R$)": lambda x: fmt_brl(x)})
+                )
+                st.dataframe(styled_df, use_container_width=True, height=400)
+
+        except Exception as e:
+            st.error(f"Erro ao processar o PDF: {str(e)}")
