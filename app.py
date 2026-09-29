@@ -43,7 +43,7 @@ class BankParsers:
         )
         for line in text_lines:
             match = pattern_saldo.search(line.strip())
-            if match:
+            if match:0
                 try:
                     return float(match.group(1).replace(".", "").replace(",", "."))
                 except ValueError:
@@ -250,6 +250,7 @@ class BankParsers:
 
             except Exception:
                 transactions = []
+
 
         # ==============================================================
         # FALLBACK: texto puro (extract_text)
@@ -588,6 +589,13 @@ if uploaded_file is not None:
 
         try:
             pdf_bytes = uploaded_file.read()
+
+            # COLE TEMPORARIAMENTE logo após pdf_bytes = uploaded_file.read()
+with st.expander("🔬 DEBUG — coordenadas X reais do PDF"):
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as _pdf:
+        _words = _pdf.pages[0].extract_words(x_tolerance=3, y_tolerance=3)
+        for _w in _words[:80]:
+            st.text(f"x0={_w['x0']:7.2f}  x1={_w['x1']:7.2f}  top={_w['top']:7.2f}  '{_w['text']}'")
 
             text_lines = []
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
