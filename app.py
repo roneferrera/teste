@@ -59,61 +59,35 @@ class BankParsers:
 
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
-        """
-        Parser Santander Internet Banking Empresarial.
-        Estratégia: usa extract_words por coordenadas para separar
-        as colunas DATA / HISTÓRICO / DOCUMENTO / VALOR / SALDO.
-        O sinal do valor é determinado pela posição x0 do número
-        (valores negativos ficam ligeiramente mais à direita no PDF
-        por causa do sinal gráfico em vermelho, mas o texto vem sem '-').
-        Solução: captura AMBOS os valores na faixa e usa o saldo
-        para recalcular o sinal, OU lê o sinal pelo bbox de cor —
-        como não temos acesso à cor via pdfplumber de forma simples,
-        usamos a estratégia de texto puro com regex robusto.
-        """
 
-        SKIP_TERMS = [
-            "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
-            "SALDO DISPONIVEL", "SALDO EM INVESTIMENTOS",
-            "SALDO DE CONTA", "A - SALDO", "B - SALDO",
-            "C - SALDO", "D - SALDO", "E - SALDO", "F - SALDO",
-            "A = SALDO", "B = SALDO", "BLOQUEIO DIA",
-            "LANCAMENTO PROVISIONADO", "INTERNET BANKING",
-            "CONTA CORRENTE", "CENTRAL DE ATENDIMENTO",
-            "SAC", "OUVIDORIA", "4004", "0800",
-            "PERIODO", "AGENCIA", "V&T", "DATA/HORA",
-            "DAS 8H", "ATENDIMENTO", "CANAL EXCLUSIVO", "LIBRAS",
-            "TOTAL", "RESUMO",
+        SKIP_HIST = {
+            "SALDO ANTERIOR", "RESGATE CONTAMAX AUTOMATICO",
+            "APLICACAO CONTAMAX", "APLICAÇÃO CONTAMAX",
+            "RESGATE CONTAMAX", "BLOQUEIO DIA",
+        }
+
+        SKIP_PARTIAL = [
+            "SALDO DIA", "SALDO BLOQUEADO", "SALDO DISPONIVEL",
+            "SALDO EM INVESTIMENTOS", "SALDO DE CONTA",
+            "A - SALDO", "B - SALDO", "C - SALDO", "D - SALDO",
+            "E - SALDO", "F - SALDO", "A = SALDO", "B = SALDO",
+            "LANCAMENTO PROVISIONADO",
         ]
 
-        # Termos que são LINHA DE CABEÇALHO — descartar linha inteira
-        HEADER_TERMS = {"DATA", "HISTORICO", "DOCUMENTO", "VALOR", "SALDO"}
-
-        IGNORE_HIST = [
-            "RESGATE CONTAMAX",
-            "APLICACAO CONTAMAX",
-        ]
-
-        RE_DATE      = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-        RE_VALUE_POS = re.compile(r"^[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")   # 1.234,56
-        RE_VALUE_NEG = re.compile(r"^-[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")  # -1.234,56
-        RE_VALUE_ANY = re.compile(r"^-?[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")
-        RE_DOC       = re.compile(r"^\d{4,6}$")
-        RE_FLAG      = re.compile(r"^[abpABP]$")
+        RE_DATE  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+        RE_VALUE = re.compile(r"^-?[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")
+        RE_DOC   = re.compile(r"^\d{4,6}$")
+        RE_FLAG  = re.compile(r"^[abpABP]$")
 
         normalize = BankParsers._normalize
 
-        def is_skip(text):
-            u = normalize(text)
-            return any(s in u for s in SKIP_TERMS)
-
-        def is_header(text):
-            u = normalize(text)
-            return u in HEADER_TERMS
-
-        def is_ignore(text):
-            u = normalize(text)
-            return any(s in u for s in IGNORE_HIST)
+        def is_skip_hist(hist):
+            h = normalize(hist)
+            if h in {normalize(s) for s in SKIP_HIST}:
+                return True
+            if any(normalize(s) in h for s in SKIP_PARTIAL):
+                return True
+            return False
 
         def is_invalid_desc(s):
             if not s:
@@ -126,179 +100,225 @@ class BankParsers:
 
         transactions = []
 
-        # ════════════════════════════════════════════════════════════
-        # ESTRATÉGIA PRINCIPAL: texto puro via extract_text
-        # O pdfplumber extrai o texto do Santander IB muito bem.
-        # Cada lançamento ocupa 1 ou mais linhas:
-        #   Linha principal: DD/MM/AAAA [flag] HISTORICO... DOC VALOR [SALDO]
-        #   Linhas extras  : continuação do HISTORICO (sem data/valor)
-        # ════════════════════════════════════════════════════════════
-        if pdf_bytes:
-            try:
-                all_lines = []
-                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                    for page in pdf.pages:
-                        txt = page.extract_text(x_tolerance=2, y_tolerance=3)
-                        if txt:
-                            all_lines.extend(txt.split("\n"))
+        if not pdf_bytes:
+            return transactions
 
-                # Remove linhas vazias, cabeçalhos e rodapés
-                clean = []
-                for raw in all_lines:
-                    s = raw.strip()
-                    if not s:
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+
+                # ── Passo 1: detectar coordenadas X das colunas ──
+                # Lê o cabeçalho "Data Histórico Documento Valor Saldo"
+                col_x = {}
+                for page in pdf.pages:
+                    words = page.extract_words(
+                        x_tolerance=4, y_tolerance=3,
+                        keep_blank_chars=False, use_text_flow=False,
+                    )
+                    by_y = defaultdict(list)
+                    for w in words:
+                        by_y[round(w["top"])].append(w)
+
+                    for y_key in sorted(by_y):
+                        row = by_y[y_key]
+                        norms = [normalize(w["text"]) for w in row]
+                        if "DATA" in norms and "VALOR" in norms:
+                            for w in row:
+                                n = normalize(w["text"])
+                                if n in ("DATA", "HISTORICO", "DOCUMENTO",
+                                         "VALOR", "SALDO"):
+                                    col_x[n] = (w["x0"], w["x1"])
+                            if len(col_x) >= 4:
+                                break
+                    if len(col_x) >= 4:
+                        break
+
+                # Fallback: coordenadas medidas diretamente do PDF do Santander IB
+                if len(col_x) < 4:
+                    col_x = {
+                        "DATA":      (55,  130),
+                        "HISTORICO": (140, 390),
+                        "DOCUMENTO": (390, 470),
+                        "VALOR":     (470, 570),
+                        "SALDO":     (570, 750),
+                    }
+
+                # Limites de cada coluna:
+                # cada coluna vai de x0 da coluna até x0 da próxima - 2
+                cols_sorted = sorted(col_x.items(), key=lambda c: c[1][0])
+
+                def get_range(name):
+                    for i, (n, (x0, x1)) in enumerate(cols_sorted):
+                        if n == name:
+                            start = x0 - 6
+                            if i + 1 < len(cols_sorted):
+                                end = cols_sorted[i + 1][1][0] - 2
+                            else:
+                                end = 9999
+                            return (start, end)
+                    return None
+
+                R_DATE = get_range("DATA")      or (49,  134)
+                R_HIST = get_range("HISTORICO") or (134, 388)
+                R_DOC  = get_range("DOCUMENTO") or (388, 468)
+                R_VAL  = get_range("VALOR")     or (468, 568)
+                # Saldo: tudo à direita de R_VAL[1]
+
+                # ── Passo 2: extrair palavras página a página ──
+                for page in pdf.pages:
+                    words = page.extract_words(
+                        x_tolerance=4, y_tolerance=3,
+                        keep_blank_chars=False, use_text_flow=False,
+                    )
+                    if not words:
                         continue
-                    if is_header(s):
-                        continue
-                    # Linha de cabeçalho completa (Data Histórico Documento...)
-                    norm = normalize(s)
-                    if ("DATA" in norm and "HISTORICO" in norm
-                            and "DOCUMENTO" in norm):
-                        continue
-                    clean.append(s)
 
-                # Agrupa linhas de continuação com a linha principal
-                # Uma linha principal começa com DD/MM/AAAA
-                RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}\b")
-                merged = []
-                for line in clean:
-                    if RE_DATE_START.match(line):
-                        merged.append(line)
-                    elif merged:
-                        # Continuação: anexa à linha anterior
-                        merged[-1] = merged[-1] + " " + line
+                    # Agrupa por Y arredondado (tolerância de 2pt)
+                    by_y = defaultdict(list)
+                    for w in words:
+                        by_y[round(w["top"] / 2) * 2].append(w)
 
-                # Regex principal para extrair campos do lançamento
-                # Formato: DD/MM/AAAA [flag] HISTORICO DOC VALOR [SALDO]
-                # O VALOR pode ser positivo ou negativo
-                # O SALDO pode ou não aparecer
-                PAT = re.compile(
-                    r"^(\d{2}/\d{2}/\d{4})"          # grupo 1: data
-                    r"(?:\s+[abpABP])?"               # flag opcional
-                    r"\s+(.+?)"                        # grupo 2: histórico (lazy)
-                    r"\s+(\d{4,6})"                    # grupo 3: documento
-                    r"\s+(-?[\d\.]+,\d{2})"            # grupo 4: valor
-                    r"(?:\s+-?[\d\.]+,\d{2})?"         # saldo opcional
-                    r"\s*$"
-                )
+                    sorted_ys = sorted(by_y.keys())
 
-                for line in merged:
-                    s = line.strip()
-                    if not s:
-                        continue
+                    # ── Passo 3: agrupa linhas em blocos de lançamento ──
+                    # Um novo bloco começa quando a linha tem DATA + VALOR
+                    # ou quando tem DATA sem continuação de histórico.
+                    # Linhas de continuação (só histórico, sem data/valor)
+                    # são anexadas ao bloco anterior.
 
-                    # Descarta linhas de saldo/resumo
-                    if is_skip(s):
-                        continue
+                    blocks = []  # lista de listas de y_keys
 
-                    m = PAT.match(s)
-                    if not m:
-                        continue
+                    for y in sorted_ys:
+                        row = by_y[y]
 
-                    dt_str   = m.group(1)
-                    hist_raw = m.group(2).strip()
-                    doc      = m.group(3)
-                    val_str  = m.group(4)
+                        has_date = any(
+                            R_DATE[0] <= w["x0"] < R_DATE[1]
+                            and RE_DATE.match(w["text"])
+                            for w in row
+                        )
+                        has_val = any(
+                            R_VAL[0] <= w["x0"] < R_VAL[1]
+                            and RE_VALUE.match(w["text"])
+                            for w in row
+                        )
+                        has_hist = any(
+                            R_HIST[0] <= w["x0"] < R_HIST[1]
+                            for w in row
+                        )
+                        has_flag = (
+                            len(row) == 1
+                            and RE_FLAG.match(row[0]["text"])
+                        )
 
-                    # Limpa o histórico: remove tokens que são doc/valor/saldo
-                    # que possam ter sido capturados pelo grupo lazy
-                    hist_tokens = hist_raw.split()
-                    hist_clean  = []
-                    for tok in hist_tokens:
-                        if RE_DOC.match(tok):
+                        if not blocks:
+                            blocks.append([y])
                             continue
-                        if RE_VALUE_ANY.match(tok):
+
+                        last_block = blocks[-1]
+                        last_y     = last_block[-1]
+                        gap        = y - last_y
+
+                        # Linha de continuação: próxima ao bloco anterior,
+                        # sem data própria, sem valor, com texto no histórico
+                        is_continuation = (
+                            gap <= 30
+                            and not has_date
+                            and not has_val
+                            and (has_hist or has_flag)
+                        )
+
+                        if is_continuation:
+                            last_block.append(y)
+                        else:
+                            blocks.append([y])
+
+                    # ── Passo 4: processa cada bloco ──
+                    for block in blocks:
+                        all_words = []
+                        for y in block:
+                            all_words.extend(by_y[y])
+
+                        date_words = []
+                        hist_words = []
+                        val_words  = []
+
+                        for w in sorted(all_words,
+                                        key=lambda x: (x["top"], x["x0"])):
+                            x0 = w["x0"]
+                            t  = w["text"]
+
+                            if R_DATE[0] <= x0 < R_DATE[1]:
+                                # Aceita data ou flag (ignora flag)
+                                if RE_DATE.match(t):
+                                    date_words.append(w)
+                                # flags (a/b/p) na coluna data → ignora
+
+                            elif R_HIST[0] <= x0 < R_HIST[1]:
+                                # Ignora tokens que são doc ou valor
+                                if not RE_DOC.match(t) and not RE_VALUE.match(t):
+                                    hist_words.append(w)
+
+                            elif R_DOC[0] <= x0 < R_DOC[1]:
+                                pass  # documento → ignora
+
+                            elif R_VAL[0] <= x0 < R_VAL[1]:
+                                if RE_VALUE.match(t):
+                                    val_words.append(w)
+                            # x0 >= R_VAL[1] → saldo → ignora
+
+                        # Monta strings
+                        date_str = " ".join(w["text"] for w in date_words).strip()
+
+                        # Reconstrói histórico linha a linha (mantém ordem Y)
+                        hist_by_y = defaultdict(list)
+                        for w in hist_words:
+                            hist_by_y[round(w["top"] / 2) * 2].append(w)
+                        hist_lines = []
+                        for hy in sorted(hist_by_y):
+                            lw = sorted(hist_by_y[hy], key=lambda x: x["x0"])
+                            hist_lines.append(" ".join(w["text"] for w in lw))
+                        hist_str = " ".join(hist_lines).strip()
+
+                        # Pega apenas o PRIMEIRO valor da coluna Valor
+                        # (o segundo, se existir, é o Saldo)
+                        val_str = val_words[0]["text"].strip() if val_words else ""
+
+                        # ── Validações ──
+                        if not RE_DATE.match(date_str):
                             continue
-                        if RE_FLAG.fullmatch(tok):
+                        if not val_str or not RE_VALUE.match(val_str):
                             continue
-                        hist_clean.append(tok)
-                    hist_str = " ".join(hist_clean).strip()
+                        if not hist_str:
+                            continue
+                        if is_skip_hist(hist_str):
+                            continue
+                        if is_invalid_desc(hist_str):
+                            continue
 
-                    if not hist_str or is_invalid_desc(hist_str):
-                        continue
-                    if is_skip(hist_str) or is_ignore(hist_str):
-                        continue
+                        dt_obj = BankParsers._parse_date(date_str)
+                        if not dt_obj:
+                            continue
 
-                    dt_obj = BankParsers._parse_date(dt_str)
-                    if not dt_obj:
-                        continue
+                        try:
+                            val = float(
+                                val_str.replace(".", "").replace(",", "."))
+                        except ValueError:
+                            continue
 
-                    try:
-                        val = float(val_str.replace(".", "").replace(",", "."))
-                    except ValueError:
-                        continue
+                        transactions.append({
+                            "date_obj":    dt_obj,
+                            "amount":      val,
+                            "description": hist_str,
+                        })
 
-                    transactions.append({
-                        "date_obj":    dt_obj,
-                        "amount":      val,
-                        "description": hist_str,
-                    })
-
-                if transactions:
-                    return transactions
-
-            except Exception as e:
-                transactions = []
-
-        # ════════════════════════════════════════════════════════════
-        # FALLBACK: text_lines já extraídas externamente
-        # ════════════════════════════════════════════════════════════
-        RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}\b")
-        merged = []
-        for raw in text_lines:
-            s = raw.strip()
-            if not s:
-                continue
-            if is_skip(s) or is_header(normalize(s)):
-                continue
-            if RE_DATE_START.match(s):
-                merged.append(s)
-            elif merged:
-                merged[-1] += " " + s
-
-        PAT2 = re.compile(
-            r"^(\d{2}/\d{2}/\d{4})"
-            r"(?:\s+[abpABP])?"
-            r"\s+(.+?)"
-            r"\s+(\d{4,6})"
-            r"\s+(-?[\d\.]+,\d{2})"
-            r"(?:\s+-?[\d\.]+,\d{2})?"
-            r"\s*$"
-        )
-        for line in merged:
-            s = line.strip()
-            if not s or is_skip(s):
-                continue
-            m = PAT2.match(s)
-            if not m:
-                continue
-            dt_str, hist_raw, _doc, val_str = m.group(1, 2, 3, 4)
-            hist_tokens = hist_raw.split()
-            hist_clean  = [
-                t for t in hist_tokens
-                if not RE_DOC.match(t)
-                and not RE_VALUE_ANY.match(t)
-                and not RE_FLAG.fullmatch(t)
-            ]
-            hist_str = " ".join(hist_clean).strip()
-            if not hist_str or is_invalid_desc(hist_str):
-                continue
-            if is_skip(hist_str) or is_ignore(hist_str):
-                continue
-            dt_obj = BankParsers._parse_date(dt_str)
-            if not dt_obj:
-                continue
-            try:
-                val = float(val_str.replace(".", "").replace(",", "."))
-                transactions.append({
-                    "date_obj":    dt_obj,
-                    "amount":      val,
-                    "description": hist_str,
-                })
-            except ValueError:
-                pass
+        except Exception as e:
+            # Em produção remova o print; aqui ajuda no diagnóstico
+            import traceback
+            traceback.print_exc()
+            return []
 
         return transactions
+
+    # ── Outros bancos ────────────────────────────────────────────────
 
     @staticmethod
     def itau(text_lines):
@@ -309,7 +329,8 @@ class BankParsers:
         )
         for line in text_lines:
             s = line.strip()
-            if any(t in s.upper() for t in ["SALDO DA CONTA", "SD CTA/APL", "SALDO ANTERIOR"]):
+            if any(t in s.upper() for t in
+                   ["SALDO DA CONTA", "SD CTA/APL", "SALDO ANTERIOR"]):
                 continue
             m = pattern.search(s)
             if m:
@@ -335,7 +356,8 @@ class BankParsers:
         )
         for line in text_lines:
             s = line.strip()
-            if any(t in s.upper() for t in ["SALDO ANTERIOR", "S A L D O", "RESUMO"]):
+            if any(t in s.upper() for t in
+                   ["SALDO ANTERIOR", "S A L D O", "RESUMO"]):
                 continue
             m = pattern.search(s)
             if m:
@@ -361,7 +383,8 @@ class BankParsers:
         )
         for line in text_lines:
             s = line.strip()
-            if any(t in s.upper() for t in ["SALDO ANTERIOR", "ULTIMO SALDO"]):
+            if any(t in s.upper() for t in
+                   ["SALDO ANTERIOR", "ULTIMO SALDO"]):
                 continue
             m = pattern.search(s)
             if m:
@@ -382,7 +405,8 @@ class BankParsers:
     def caixas(text_lines):
         transactions = []
         pattern = re.compile(
-            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s*(?:\d+)?\s+(.+?)\s+([\d\.]+\,\d{2})\s*([CD])",
+            r"(\d{2}/\d{2}(?:/\d{2,4})?)\s*(?:\d+)?\s+(.+?)"
+            r"\s+([\d\.]+\,\d{2})\s*([CD])",
             re.IGNORECASE
         )
         for line in text_lines:
@@ -413,7 +437,8 @@ class BankParsers:
         )
         for line in text_lines:
             s = line.strip()
-            if any(t in s.upper() for t in ["SALDO ANTERIOR", "RENDIMENTO", "TOTAL"]):
+            if any(t in s.upper() for t in
+                   ["SALDO ANTERIOR", "RENDIMENTO", "TOTAL"]):
                 continue
             m = pattern.search(s)
             if m:
@@ -430,6 +455,8 @@ class BankParsers:
                 })
         return transactions
 
+
+# ── Mapeamento de bancos ─────────────────────────────────────────────
 
 BANK_MAPPING = {
     "Itaú Unibanco (341)":           (BankParsers.itau,            "341"),
@@ -470,8 +497,9 @@ def detect_bank(text_lines):
                                          ("0800 704 8383", 4)]),
         ("Banco do Brasil (001)",       [("BANCO DO BRASIL", 5), ("BB.COM.BR", 5),
                                          ("0800 729 0722", 4), ("AGENCIA BB", 3)]),
-        ("Caixa Econômica Federal (104)",[("CAIXA ECONOMICA FEDERAL", 5), ("CEF", 2),
-                                          ("0800 726 0101", 4), ("CAIXA.GOV", 4)]),
+        ("Caixa Econômica Federal (104)",[("CAIXA ECONOMICA FEDERAL", 5),
+                                          ("CEF", 2), ("0800 726 0101", 4),
+                                          ("CAIXA.GOV", 4)]),
         ("Sicoob (756)",                [("SICOOB", 5), ("0800 642 2200", 4)]),
         ("Sicredi (748)",               [("SICREDI", 5), ("0800 724 7220", 4)]),
         ("Banco Inter (077)",           [("BANCO INTER", 5), ("INTER S.A", 4),
@@ -495,8 +523,10 @@ def detect_bank(text_lines):
 
 def generate_ofx(transactions, bank_code="000"):
     now      = datetime.now().strftime("%Y%m%d%H%M%S")
-    dt_start = transactions[0]["date_obj"].strftime("%Y%m%d") if transactions else now
-    dt_end   = transactions[-1]["date_obj"].strftime("%Y%m%d") if transactions else now
+    dt_start = (transactions[0]["date_obj"].strftime("%Y%m%d")
+                if transactions else now)
+    dt_end   = (transactions[-1]["date_obj"].strftime("%Y%m%d")
+                if transactions else now)
     ofx = f"""OFXHEADER:100
 DATA:OFXSGML
 VERSION:102
@@ -559,7 +589,8 @@ def fmt_brl(v):
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-# ── UI Streamlit ──
+# ── UI Streamlit ─────────────────────────────────────────────────────
+
 st.title("🏦 Conversor de Extrato PDF para OFX")
 st.write("Faça o upload do PDF — o banco será detectado automaticamente.")
 
@@ -592,9 +623,11 @@ with col1:
     )
     if uploaded_file is not None:
         if detected_bank:
-            st.success(f"✅ Banco detectado automaticamente: **{detected_bank}**")
+            st.success(
+                f"✅ Banco detectado automaticamente: **{detected_bank}**")
         else:
-            st.warning("⚠️ Banco não identificado. Selecione manualmente abaixo.")
+            st.warning(
+                "⚠️ Banco não identificado. Selecione manualmente abaixo.")
     bank_selected = st.selectbox(
         "Leiaute do Banco:", options=bank_options, index=default_index)
 
@@ -622,13 +655,12 @@ if uploaded_file is not None:
             )
 
             if not transactions:
-                # ── DEBUG: mostra as linhas extraídas para diagnóstico ──
-                with st.expander("🔍 Debug — linhas extraídas do PDF"):
+                with st.expander("🔍 Debug — linhas extraídas do PDF (primeiras 80)"):
                     for i, l in enumerate(text_lines[:80]):
                         st.text(f"{i:03d}: {l}")
                 st.error(
                     "Nenhum lançamento identificado. "
-                    "Verifique as linhas acima para diagnóstico.")
+                    "Veja o debug acima para diagnóstico.")
             else:
                 transactions.sort(key=lambda x: x["date_obj"])
 
@@ -651,7 +683,8 @@ if uploaded_file is not None:
                 m4.metric("Saldo Final",          fmt_brl(final_balance))
 
                 ofx_data        = generate_ofx(transactions, bank_code)
-                output_filename = os.path.splitext(uploaded_file.name)[0] + ".ofx"
+                output_filename = (
+                    os.path.splitext(uploaded_file.name)[0] + ".ofx")
 
                 col_dl1, col_dl2 = st.columns(2)
                 with col_dl1:
@@ -667,7 +700,8 @@ if uploaded_file is not None:
                         "Descrição":  t["description"],
                         "Tipo":       "Entrada" if t["amount"] > 0 else "Saída",
                         "Valor (R$)": t["amount"],
-                    } for t in transactions]).to_csv(index=False).encode("utf-8")
+                    } for t in transactions]).to_csv(
+                        index=False).encode("utf-8")
                     st.download_button(
                         "📥 Baixar CSV",
                         data=csv_data,
