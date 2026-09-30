@@ -74,7 +74,7 @@ class BankParsers:
             "APLICAÇÃO CONTAMAX",
         ]
 
-        RE_FLAG      = re.compile(r"^[abp]\.?$", re.IGNORECASE)
+        RE_FLAG      = re.compile(r"^[abp]$", re.IGNORECASE)
         RE_DATE_FULL = re.compile(r"^\d{2}/\d{2}/\d{4}$")
         RE_VALUE     = re.compile(r"^-?[\d\.]+,\d{2}$")
         RE_DOC       = re.compile(r"^\d{5,6}$")
@@ -101,34 +101,37 @@ class BankParsers:
 
         transactions = []
 
-        # ══════════════════════════════════════════════════════════
-        # ESTRATÉGIA 1 — extract_tables (usa bordas reais da tabela)
-        # O Santander gera PDF a partir de HTML com tabela.
-        # extract_tables agrupa sub-linhas de cada célula sozinho,
-        # resolvendo o histórico quebrado em múltiplas linhas.
-        # ══════════════════════════════════════════════════════════
-        if pdf_bytes:
+        if not pdf_bytes:
+            # sem PDF, vai direto para estratégia 3
+            pass
+        else:
+            # ══════════════════════════════════════════════════════
+            # ESTRATÉGIA PRINCIPAL: lê o PDF célula a célula
+            # usando extract_tables com bordas reais da tabela.
+            # Cada célula multilinhas já vem concatenada com \n.
+            # Fazemos join das linhas de cada célula para obter
+            # o texto completo sem quebras artificiais de palavra.
+            # ══════════════════════════════════════════════════════
             try:
                 table_settings = {
-                    "vertical_strategy":      "lines",
-                    "horizontal_strategy":    "lines",
-                    "snap_tolerance":          4,
-                    "join_tolerance":          4,
-                    "edge_min_length":         5,
-                    "min_words_vertical":      1,
-                    "min_words_horizontal":    1,
-                    "intersection_tolerance":  5,
+                    "vertical_strategy":     "lines",
+                    "horizontal_strategy":   "lines",
+                    "snap_tolerance":         4,
+                    "join_tolerance":         4,
+                    "edge_min_length":        5,
+                    "min_words_vertical":     1,
+                    "min_words_horizontal":   1,
+                    "intersection_tolerance": 5,
                 }
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
                         tables = page.extract_tables(table_settings)
-
                         if not tables:
                             tables = page.extract_tables({
                                 "vertical_strategy":   "lines",
                                 "horizontal_strategy": "text",
-                                "snap_tolerance":       4,
+                                "snap_tolerance": 4,
                             })
 
                         for table in (tables or []):
@@ -136,7 +139,33 @@ class BankParsers:
                                 if not row:
                                     continue
 
-                                cells = [clean(c) for c in row]
+                                # Cada célula pode ter \n interno (multilinhas).
+                                # Fazemos join SEM espaço para reconstituir
+                                # palavras quebradas pelo layout da célula.
+                                # Ex: "TELEFONE CELULAR VI\nVO CELULAR"
+                                #  → "TELEFONE CELULAR VIVO CELULAR"
+                                def join_cell(c):
+                                    if not c:
+                                        return ""
+                                    # Junta as sub-linhas sem espaço extra
+                                    # (o Santander quebra palavras no limite
+                                    # da célula, não entre palavras)
+                                    parts = [p.strip() for p in str(c).split("\n") if p.strip()]
+                                    if not parts:
+                                        return ""
+                                    result = parts[0]
+                                    for p in parts[1:]:
+                                        # Se a última char da parte anterior
+                                        # e a primeira da próxima são letras,
+                                        # é quebra de palavra → sem espaço
+                                        if result and p and result[-1].isalpha() and p[0].isalpha():
+                                            result += p
+                                        else:
+                                            result += " " + p
+                                    return " ".join(result.split()).strip()
+
+                                cells = [join_cell(c) for c in row]
+
                                 if not any(cells):
                                     continue
 
@@ -150,9 +179,9 @@ class BankParsers:
                                     if RE_DATE_FULL.match(cell) and not date_str:
                                         date_str = cell
                                     elif RE_DOC.match(cell):
-                                        pass
+                                        pass  # documento
                                     elif RE_FLAG.match(cell):
-                                        pass
+                                        pass  # flag a/b/p
                                     elif RE_VALUE.match(cell) and not val_str:
                                         val_str = cell
                                     elif (len(cell) > 2
@@ -192,72 +221,75 @@ class BankParsers:
             except Exception:
                 transactions = []
 
-        # ══════════════════════════════════════════════════════════
-        # ESTRATÉGIA 2 — extract_text(layout=True)
-        # Preserva estrutura colunar. Reagrupa linhas sem data
-        # como continuação do lançamento anterior.
-        # ══════════════════════════════════════════════════════════
-        if pdf_bytes and not transactions:
-            try:
-                RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
-                all_lines = []
+            # ══════════════════════════════════════════════════════
+            # ESTRATÉGIA 2: extract_text com layout=True
+            # Reagrupa linhas sem data como continuação da anterior.
+            # ══════════════════════════════════════════════════════
+            if not transactions:
+                try:
+                    RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
+                    all_lines = []
 
-                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                    for page in pdf.pages:
-                        text = page.extract_text(layout=True) or page.extract_text()
-                        if text:
-                            all_lines.extend(text.split("\n"))
+                    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                        for page in pdf.pages:
+                            text = page.extract_text(layout=True) or page.extract_text()
+                            if text:
+                                all_lines.extend(text.split("\n"))
 
-                merged = []
-                for raw in all_lines:
-                    s = raw.strip()
-                    if not s or is_skip(s) or is_ignore(s):
-                        continue
-                    if RE_DATE_START.match(s):
-                        merged.append(s)
-                    elif merged:
-                        merged[-1] += " " + s
-
-                PAT = re.compile(
-                    r"(\d{2}/\d{2}/\d{4})"
-                    r"(?:\s+[abp]\.?)?"
-                    r"\s+(.+?)"
-                    r"\s+(\d{5,6})"
-                    r"\s+(-?[\d\.]+,\d{2})"
-                    r"(?:\s+-?[\d\.]+,\d{2})?",
-                    re.IGNORECASE,
-                )
-
-                for line in merged:
-                    s = line.strip()
-                    if is_skip(s) or is_ignore(s):
-                        continue
-                    m = PAT.search(s)
-                    if m:
-                        dt_str, desc, _doc, val_str = m.group(1, 2, 3, 4)
-                        desc = clean(desc)
-                        if is_invalid_desc(desc):
+                    merged = []
+                    for raw in all_lines:
+                        s = raw.strip()
+                        if not s or is_skip(s) or is_ignore(s):
                             continue
-                        dt_obj = BankParsers._parse_date(dt_str)
-                        if dt_obj:
-                            try:
-                                val = float(val_str.replace(".", "").replace(",", "."))
-                                transactions.append({
-                                    "date_obj":    dt_obj,
-                                    "amount":      val,
-                                    "description": desc,
-                                })
-                            except ValueError:
-                                pass
+                        if RE_DATE_START.match(s):
+                            merged.append(s)
+                        elif merged:
+                            merged[-1] += " " + s
 
-                if transactions:
-                    return transactions
+                    # Padrão: DATA [flag] HISTÓRICO DOCUMENTO VALOR [SALDO]
+                    # Documento pode ser 000000 (6 zeros) ou outro número 5-6 dígitos
+                    PAT = re.compile(
+                        r"(\d{2}/\d{2}/\d{4})"
+                        r"(?:\s+[abp])?"
+                        r"\s+(.+?)"
+                        r"\s+(\d{5,6})"
+                        r"\s+(-?[\d\.]+,\d{2})"
+                        r"(?:\s+-?[\d\.]+,\d{2})?$",
+                        re.IGNORECASE,
+                    )
 
-            except Exception:
-                pass
+                    for line in merged:
+                        s = line.strip()
+                        if is_skip(s) or is_ignore(s):
+                            continue
+                        m = PAT.search(s)
+                        if m:
+                            dt_str, desc, _doc, val_str = m.group(1, 2, 3, 4)
+                            desc = clean(desc)
+                            if is_invalid_desc(desc):
+                                continue
+                            dt_obj = BankParsers._parse_date(dt_str)
+                            if dt_obj:
+                                try:
+                                    val = float(
+                                        val_str.replace(".", "").replace(",", ".")
+                                    )
+                                    transactions.append({
+                                        "date_obj":    dt_obj,
+                                        "amount":      val,
+                                        "description": desc,
+                                    })
+                                except ValueError:
+                                    pass
+
+                    if transactions:
+                        return transactions
+
+                except Exception:
+                    pass
 
         # ══════════════════════════════════════════════════════════
-        # ESTRATÉGIA 3 — text_lines (último recurso)
+        # ESTRATÉGIA 3: text_lines passadas pelo chamador
         # ══════════════════════════════════════════════════════════
         RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
         merged = []
@@ -271,8 +303,8 @@ class BankParsers:
                 merged[-1] += " " + s
 
         PAT = re.compile(
-            r"(\d{2}/\d{2}/\d{4})(?:\s+[abp]\.?)?\s+(.+?)"
-            r"\s+(\d{5,6})\s+(-?[\d\.]+,\d{2})(?:\s+-?[\d\.]+,\d{2})?",
+            r"(\d{2}/\d{2}/\d{4})(?:\s+[abp])?\s+(.+?)"
+            r"\s+(\d{5,6})\s+(-?[\d\.]+,\d{2})(?:\s+-?[\d\.]+,\d{2})?$",
             re.IGNORECASE,
         )
         for line in merged:
@@ -669,7 +701,6 @@ if uploaded_file is not None:
                 def color_amount(val):
                     return f"color: {'#28a745' if val > 0 else '#dc3545'}; font-weight: bold;"
 
-                # Altura dinâmica: mostra todos sem precisar de scroll
                 row_height   = 35
                 header_extra = 38
                 table_height = min(len(df) * row_height + header_extra, 800)
