@@ -52,22 +52,6 @@ class BankParsers:
 
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
-        """
-        Layout Santander Empresarial — 5 colunas:
-            Data | Histórico | Documento | Valor | Saldo
-
-        Coordenadas X medidas no PDF real (A4 ~595pt):
-            Data      :  40 – 118 pt
-            Flag(a/b) : 118 – 165 pt  → capturada no hist, filtrada por RE_FLAG
-            Histórico : 118 – 388 pt
-            Documento : 388 – 460 pt  → ignorado
-            Valor     : 460 – 538 pt
-            Saldo     : 538+          → ignorado
-
-        Correção crítica: descrição final também é validada contra RE_FLAG
-        para evitar que "a" (flag de bloqueio) seja salvo como descrição.
-        """
-
         SKIP_TERMS = [
             "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
             "SALDO DISPONIVEL", "SALDO DISPONÍVEL",
@@ -86,12 +70,10 @@ class BankParsers:
             "V&T", "DATA/HORA",
         ]
 
-        # Flag de bloqueio: "a", "b", "p" isolados (com ou sem ponto)
         RE_FLAG      = re.compile(r"^[abp]\.?$", re.IGNORECASE)
         RE_DATE_FULL = re.compile(r"^\d{2}/\d{2}/\d{4}$")
         RE_VALUE     = re.compile(r"^-?[\d\.]+,\d{2}$")
 
-        # Descrição inválida: só dígitos/espaços/barras OU é uma flag
         def is_invalid_desc(s):
             return (
                 not s
@@ -101,9 +83,6 @@ class BankParsers:
 
         transactions = []
 
-        # ==============================================================
-        # MODO COORDENADAS
-        # ==============================================================
         if pdf_bytes:
             try:
                 X_DATE_MIN =  40
@@ -143,7 +122,6 @@ class BankParsers:
                                 p_date = None
                                 p_desc = []
                                 return
-                            # Filtra fragmentos de flag da lista de desc
                             clean_parts = [
                                 part for part in p_desc
                                 if not RE_FLAG.match(part.strip())
@@ -184,12 +162,10 @@ class BankParsers:
                                 if X_DATE_MIN <= x0 < X_DATE_MAX:
                                     date_tokens.append(text)
                                 elif X_HIST_MIN <= x0 < X_HIST_MAX:
-                                    # Filtra flag de bloqueio (a, b, p)
                                     if not RE_FLAG.match(text):
                                         hist_tokens.append(text)
                                 elif X_VAL_MIN <= x0 < X_VAL_MAX:
                                     val_tokens.append(text)
-                                # Documento (388-460) e Saldo (538+) → ignorados
 
                             date_str = " ".join(date_tokens).strip()
                             hist_str = " ".join(hist_tokens).strip()
@@ -198,20 +174,15 @@ class BankParsers:
                             is_date  = bool(RE_DATE_FULL.match(date_str))
                             is_value = bool(val_str and RE_VALUE.match(val_str))
 
-                            # Pula cabeçalhos/rodapés/saldos
                             combined = (date_str + " " + hist_str).upper()
                             if any(skip in combined for skip in SKIP_TERMS):
                                 discard_pending()
                                 continue
 
-                            # Linha onde hist_str é só a flag → trata como
-                            # "data sem histórico" (não interrompe pendente)
                             if hist_str and RE_FLAG.match(hist_str.strip()):
                                 hist_str = ""
 
-                            # ── Máquina de estados ───────────────────────
                             if is_date and hist_str and is_value:
-                                # Linha completa
                                 discard_pending()
                                 dt_obj = BankParsers._parse_date(date_str)
                                 if dt_obj and not is_invalid_desc(hist_str):
@@ -229,37 +200,29 @@ class BankParsers:
                                         pass
 
                             elif is_date and hist_str and not is_value:
-                                # Início de histórico quebrado
                                 discard_pending()
                                 p_date = date_str
                                 p_desc = [hist_str]
 
                             elif is_date and not hist_str and is_value:
-                                # Data + valor sem histórico na mesma linha
-                                # (raro — fecha pendente)
                                 if p_date:
                                     save_pending(val_str)
                                 else:
                                     discard_pending()
 
                             elif is_date and not hist_str and not is_value:
-                                # Data sem histórico e sem valor
-                                # Não interrompe pendente (ex: data repetida)
                                 pass
 
                             elif not is_date and hist_str and is_value:
-                                # Continuação com valor
                                 if p_date:
                                     p_desc.append(hist_str)
                                     save_pending(val_str)
 
                             elif not is_date and hist_str and not is_value:
-                                # Continuação sem valor ainda
                                 if p_date:
                                     p_desc.append(hist_str)
 
                             elif not is_date and not hist_str and is_value:
-                                # Valor em linha separada sem histórico
                                 if p_date:
                                     save_pending(val_str)
 
@@ -271,9 +234,6 @@ class BankParsers:
             except Exception:
                 transactions = []
 
-        # ==============================================================
-        # FALLBACK: texto puro
-        # ==============================================================
         RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
 
         merged = []
@@ -291,7 +251,6 @@ class BankParsers:
                 else:
                     merged.append(s)
 
-        # DATA [flag] HISTÓRICO DOCUMENTO(5-6 dígitos) VALOR [SALDO]
         PAT = re.compile(
             r"(\d{2}/\d{2}/\d{4})"
             r"(?:\s+[abp]\.?)?"
@@ -326,9 +285,6 @@ class BankParsers:
 
         return transactions
 
-    # ------------------------------------------------------------------
-    # ITAÚ
-    # ------------------------------------------------------------------
     @staticmethod
     def itau(text_lines):
         transactions = []
@@ -356,9 +312,6 @@ class BankParsers:
                 })
         return transactions
 
-    # ------------------------------------------------------------------
-    # BANCO DO BRASIL
-    # ------------------------------------------------------------------
     @staticmethod
     def banco_do_brasil(text_lines):
         transactions = []
@@ -386,9 +339,6 @@ class BankParsers:
                 })
         return transactions
 
-    # ------------------------------------------------------------------
-    # BRADESCO
-    # ------------------------------------------------------------------
     @staticmethod
     def bradesco(text_lines):
         transactions = []
@@ -416,9 +366,6 @@ class BankParsers:
                 })
         return transactions
 
-    # ------------------------------------------------------------------
-    # CAIXA
-    # ------------------------------------------------------------------
     @staticmethod
     def caixas(text_lines):
         transactions = []
@@ -445,9 +392,6 @@ class BankParsers:
                 })
         return transactions
 
-    # ------------------------------------------------------------------
-    # GENÉRICO
-    # ------------------------------------------------------------------
     @staticmethod
     def generic_fallback(text_lines):
         transactions = []
@@ -500,7 +444,141 @@ BANK_MAPPING = {
 BYTES_AWARE_PARSERS = {"033"}
 
 # ==========================================
-# 2. GERADOR OFX
+# DETECÇÃO AUTOMÁTICA DE BANCO
+# ==========================================
+
+def detect_bank(text_lines):
+    """
+    Detecta o banco automaticamente a partir das primeiras linhas do PDF.
+    Usa sistema de pontuação para evitar falsos positivos.
+    Retorna a chave do BANK_MAPPING ou None se não identificado.
+    """
+    # Analisa as primeiras 40 linhas (cabeçalho do extrato)
+    header_text = " ".join(text_lines[:40]).upper()
+
+    # Cada banco tem uma lista de termos únicos com pesos diferentes.
+    # Termos mais específicos têm peso maior.
+    BANK_SIGNATURES = [
+        (
+            "Santander (033)", [
+                ("SANTANDER", 3),
+                ("CONTAMAX", 5),
+                ("INTERNET BANKING EMPRESARIAL", 4),
+                ("BLOQUEIO DIA", 3),
+                ("4004 2125", 4),
+                ("0800 702 2125", 4),
+            ]
+        ),
+        (
+            "Itaú Unibanco (341)", [
+                ("ITAU UNIBANCO", 5),
+                ("BANCO ITAU", 4),
+                ("ITAÚ UNIBANCO", 5),
+                ("ITOKEN", 4),
+                ("0300 789 8484", 4),
+            ]
+        ),
+        (
+            "Bradesco (237)", [
+                ("BANCO BRADESCO", 5),
+                ("BRADESCO S.A", 5),
+                ("BRADESCO PRIME", 4),
+                ("BRADESCO", 3),
+                ("0800 704 8383", 4),
+            ]
+        ),
+        (
+            "Banco do Brasil (001)", [
+                ("BANCO DO BRASIL", 5),
+                ("BB.COM.BR", 5),
+                ("0800 729 0722", 4),
+                ("AGENCIA BB", 3),
+                ("AGÊNCIA BB", 3),
+            ]
+        ),
+        (
+            "Caixa Econômica Federal (104)", [
+                ("CAIXA ECONOMICA FEDERAL", 5),
+                ("CAIXA ECONÔMICA FEDERAL", 5),
+                ("CEF", 2),
+                ("0800 726 0101", 4),
+                ("CAIXA.GOV", 4),
+            ]
+        ),
+        (
+            "Sicoob (756)", [
+                ("SICOOB", 5),
+                ("0800 642 2200", 4),
+            ]
+        ),
+        (
+            "Sicredi (748)", [
+                ("SICREDI", 5),
+                ("0800 724 7220", 4),
+            ]
+        ),
+        (
+            "Banco Inter (077)", [
+                ("BANCO INTER", 5),
+                ("INTER S.A", 4),
+                ("CONTA DIGITAL INTER", 5),
+            ]
+        ),
+        (
+            "Nubank (260)", [
+                ("NUBANK", 5),
+                ("NU PAGAMENTOS", 5),
+                ("NUCONTA", 4),
+            ]
+        ),
+        (
+            "C6 Bank (336)", [
+                ("C6 BANK", 5),
+                ("C6 S.A", 4),
+            ]
+        ),
+        (
+            "Banrisul (041)", [
+                ("BANRISUL", 5),
+                ("BANCO DO ESTADO DO RIO GRANDE", 4),
+            ]
+        ),
+        (
+            "Stone Pagamentos (197)", [
+                ("STONE PAGAMENTOS", 5),
+                ("STONECO", 4),
+            ]
+        ),
+        (
+            "Unicred (136)", [
+                ("UNICRED", 5),
+            ]
+        ),
+        (
+            "Mercado Pago (323)", [
+                ("MERCADO PAGO", 5),
+                ("MERCADOPAGO", 5),
+            ]
+        ),
+    ]
+
+    scores = {}
+    for bank_key, signatures in BANK_SIGNATURES:
+        total = sum(
+            weight for term, weight in signatures
+            if term in header_text
+        )
+        if total > 0:
+            scores[bank_key] = total
+
+    if not scores:
+        return None
+
+    return max(scores, key=lambda k: scores[k])
+
+
+# ==========================================
+# GERADOR OFX
 # ==========================================
 
 def generate_ofx(transactions, bank_code="000"):
@@ -565,8 +643,9 @@ NEWFILEDAREA:NONE
 </OFX>"""
     return ofx
 
+
 # ==========================================
-# 3. INTERFACE STREAMLIT
+# INTERFACE STREAMLIT
 # ==========================================
 
 def fmt_brl(v):
@@ -575,16 +654,57 @@ def fmt_brl(v):
 
 st.title("🏦 Conversor de Extrato PDF para OFX")
 st.write(
-    "Selecione o banco, faça o upload do PDF e visualize o resumo "
-    "financeiro com saldos e lançamentos formatados."
+    "Faça o upload do PDF — o banco será detectado automaticamente. "
+    "Você pode corrigir manualmente se necessário."
 )
 
+uploaded_file = st.file_uploader(
+    "Selecione o arquivo PDF do extrato", type=["pdf"]
+)
+
+# --- Detecção automática ao fazer upload ---
+detected_bank  = None
+preview_lines  = []
+
+if uploaded_file is not None:
+    try:
+        pdf_bytes_preview = uploaded_file.read()
+        uploaded_file.seek(0)  # Rebobina para uso posterior
+
+        with pdfplumber.open(io.BytesIO(pdf_bytes_preview)) as pdf:
+            for page in pdf.pages[:2]:  # Só as 2 primeiras páginas
+                text = page.extract_text()
+                if text:
+                    preview_lines.extend(text.split("\n"))
+
+        detected_bank = detect_bank(preview_lines)
+
+    except Exception:
+        detected_bank = None
+
+# --- Controles lado a lado ---
 col1, col2 = st.columns([2, 1])
+
 with col1:
-    bank_selected = st.selectbox(
-        "Selecione o Leiaute do Banco:",
-        options=list(BANK_MAPPING.keys())
+    bank_options  = list(BANK_MAPPING.keys())
+    default_index = (
+        bank_options.index(detected_bank)
+        if detected_bank and detected_bank in bank_options
+        else 0
     )
+
+    if uploaded_file is not None:
+        if detected_bank:
+            st.success(f"✅ Banco detectado automaticamente: **{detected_bank}**")
+        else:
+            st.warning("⚠️ Banco não identificado. Selecione manualmente abaixo.")
+
+    bank_selected = st.selectbox(
+        "Leiaute do Banco (confirme ou corrija se necessário):",
+        options=bank_options,
+        index=default_index,
+    )
+
 with col2:
     manual_initial_balance = st.number_input(
         "Saldo Inicial da Conta (R$):",
@@ -592,10 +712,7 @@ with col2:
         help="Informe o saldo anterior caso o PDF não o contenha."
     )
 
-uploaded_file = st.file_uploader(
-    "Selecione o arquivo PDF do extrato", type=["pdf"]
-)
-
+# --- Conversão ---
 if uploaded_file is not None:
     if st.button("Converter para OFX e Exibir Extrato", type="primary"):
         parser_func, bank_code = BANK_MAPPING[bank_selected]
@@ -639,10 +756,10 @@ if uploaded_file is not None:
                 st.subheader("📊 Resumo Financeiro da Conta")
 
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Saldo Inicial",       fmt_brl(initial_balance))
-                m2.metric("Entradas (Créditos)",  fmt_brl(total_credits))
-                m3.metric("Saídas (Débitos)",     fmt_brl(abs(total_debits)))
-                m4.metric("Saldo Final",           fmt_brl(final_balance))
+                m1.metric("Saldo Inicial",      fmt_brl(initial_balance))
+                m2.metric("Entradas (Créditos)", fmt_brl(total_credits))
+                m3.metric("Saídas (Débitos)",    fmt_brl(abs(total_debits)))
+                m4.metric("Saldo Final",          fmt_brl(final_balance))
 
                 ofx_data        = generate_ofx(transactions, bank_code)
                 output_filename = os.path.splitext(uploaded_file.name)[0] + ".ofx"
