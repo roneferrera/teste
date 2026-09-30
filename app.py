@@ -65,20 +65,37 @@ class BankParsers:
             "RESGATE CONTAMAX",
             "APLICACAO CONTAMAX",
             "APLICAÇÃO CONTAMAX",
+            "RESGATE CONTAMAX AUTOMATICO",
         ]
 
-        SKIP_HIST = [
+        SKIP_PARTIAL = [
             "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
             "SALDO DISPONIVEL", "SALDO EM INVESTIMENTOS",
-            "SALDO DE CONTA", "BLOQUEIO DIA",
+            "SALDO DE CONTA", "A - SALDO", "B - SALDO",
+            "C - SALDO", "D - SALDO", "E - SALDO", "F - SALDO",
+            "A = SALDO", "B = SALDO", "BLOQUEIO DIA",
             "LANCAMENTO PROVISIONADO",
+            "CENTRAL DE ATENDIMENTO", "SAC", "OUVIDORIA",
+            "4004 2125", "0800 702", "0800 726", "0800 762",
+            "DAS 8H", "SEGUNDA A SEXTA", "ATENDIMENTO",
+            "CANAL EXCLUSIVO", "LIBRAS", "EXTERIOR",
+            "A - SALDO DE CONTA", "B - SALDO BLOQUEADO",
+            "C - SALDO DISPONIVEL", "D - SALDO EM INVEST",
+            "E - SALDO DISPONIVEL", "F - SALDO DISPONIVEL",
         ]
 
         RE_DATE  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
         RE_VALUE = re.compile(r"^-?[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")
         RE_FLAG  = re.compile(r"^[abpABP]$")
+        RE_DOC   = re.compile(r"^\d{4,6}$")
 
         norm = BankParsers._normalize
+
+        def clean_hist(raw):
+            text = re.sub(r"[\r\n]+", " ", raw)
+            text = re.sub(r"\s{2,}", " ", text)
+            text = re.sub(r"^[abpABP]\s+", "", text).strip()
+            return text
 
         def is_ignore(hist):
             h = norm(hist)
@@ -86,7 +103,7 @@ class BankParsers:
 
         def is_skip(hist):
             h = norm(hist)
-            return any(norm(s) in h for s in SKIP_HIST)
+            return any(norm(s) in h for s in SKIP_PARTIAL)
 
         def is_invalid_desc(s):
             if not s:
@@ -105,158 +122,20 @@ class BankParsers:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
+                page_w = pdf.pages[0].width
+
+                # ══════════════════════════════════════════════════
+                # PASSO 1 — Detectar coordenadas X das colunas
+                # ══════════════════════════════════════════════════
+                col_x = {}
                 for page in pdf.pages:
-
-                    # ══════════════════════════════════════════════
-                    # Usa extract_table com as linhas reais do PDF
-                    # O Santander IB tem linhas horizontais entre
-                    # cada lançamento — pdfplumber detecta isso
-                    # automaticamente via page.horizontal_edges
-                    # ══════════════════════════════════════════════
-                    table_settings = {
-                        "vertical_strategy":   "lines",
-                        "horizontal_strategy": "lines",
-                        "snap_tolerance":       4,
-                        "join_tolerance":       4,
-                        "edge_min_length":     100,
-                        "min_words_vertical":    1,
-                        "min_words_horizontal":  1,
-                        "intersection_tolerance": 5,
-                        "text_tolerance":         3,
-                        "text_x_tolerance":       3,
-                        "text_y_tolerance":       3,
-                    }
-
-                    tables = page.extract_tables(table_settings)
-
-                    for table in tables:
-                        for row in table:
-                            if not row:
-                                continue
-
-                            # Limpa células None
-                            cells = [
-                                (c.strip() if c else "")
-                                for c in row
-                            ]
-
-                            # Remove linhas completamente vazias
-                            if not any(cells):
-                                continue
-
-                            # Detecta se é linha de cabeçalho
-                            joined = " ".join(cells)
-                            joined_norm = norm(joined)
-                            if ("DATA" in joined_norm
-                                    and "HISTORICO" in joined_norm
-                                    and "VALOR" in joined_norm):
-                                continue
-
-                            # A tabela do Santander tem 5 colunas:
-                            # [Data, Histórico, Documento, Valor, Saldo]
-                            # Mas o número pode variar — detecta pelo conteúdo
-                            date_str = ""
-                            hist_str = ""
-                            val_str  = ""
-
-                            # Tenta identificar cada campo pelo conteúdo
-                            for cell in cells:
-                                c = cell.strip()
-                                if not c:
-                                    continue
-                                # Remove flag (a/b/p) que aparece junto à data
-                                c_clean = re.sub(
-                                    r"\s+[abpABP]\s*$", "", c).strip()
-                                c_clean = re.sub(
-                                    r"^[abpABP]\s+", "", c_clean).strip()
-
-                                if RE_DATE.match(c_clean):
-                                    date_str = c_clean
-                                elif RE_VALUE.match(c.replace(" ", "")):
-                                    # Pega apenas o primeiro valor
-                                    # (segundo é saldo)
-                                    if not val_str:
-                                        val_str = c.replace(" ", "")
-                                elif re.fullmatch(r"\d{4,6}", c):
-                                    pass  # documento → ignora
-                                elif c_clean and not RE_DATE.match(c_clean):
-                                    if hist_str:
-                                        hist_str += " " + c_clean
-                                    else:
-                                        hist_str = c_clean
-
-                            # Validações
-                            if not date_str:
-                                continue
-                            if not val_str or not RE_VALUE.match(val_str):
-                                continue
-                            if not hist_str:
-                                continue
-                            if is_skip(hist_str):
-                                continue
-                            if is_ignore(hist_str):
-                                continue
-                            if is_invalid_desc(hist_str):
-                                continue
-
-                            dt_obj = BankParsers._parse_date(date_str)
-                            if not dt_obj:
-                                continue
-
-                            try:
-                                val = float(
-                                    val_str.replace(".", "").replace(",", "."))
-                            except ValueError:
-                                continue
-
-                            transactions.append({
-                                "date_obj":    dt_obj,
-                                "amount":      val,
-                                "description": hist_str,
-                            })
-
-                # Se extract_tables não retornou nada útil,
-                # tenta abordagem por células individuais via bbox das linhas
-                if not transactions:
-                    transactions = BankParsers._santander_by_hlines(
-                        pdf_bytes, norm, is_ignore, is_skip,
-                        is_invalid_desc, RE_DATE, RE_VALUE, RE_FLAG)
-
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            return []
-
-        return transactions
-
-    @staticmethod
-    def _santander_by_hlines(pdf_bytes, norm, is_ignore, is_skip,
-                              is_invalid_desc, RE_DATE, RE_VALUE, RE_FLAG):
-        """
-        Abordagem alternativa: usa as linhas horizontais reais do PDF
-        para delimitar cada lançamento, depois extrai o texto de cada
-        célula individualmente usando within_bbox.
-        """
-        transactions = []
-        RE_DOC = re.compile(r"^\d{4,6}$")
-
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-
-                for page in pdf.pages:
-                    page_w = page.width
-                    page_h = page.height
-
-                    # ── Detecta coordenadas X das colunas ──
-                    col_x = {}
-                    words_all = page.extract_words(
+                    words = page.extract_words(
                         x_tolerance=3, y_tolerance=3,
                         keep_blank_chars=False, use_text_flow=False,
                     )
                     by_y = defaultdict(list)
-                    for w in words_all:
+                    for w in words:
                         by_y[round(w["top"])].append(w)
-
                     for y_key in sorted(by_y):
                         row   = by_y[y_key]
                         norms = [norm(w["text"]) for w in row]
@@ -268,95 +147,151 @@ class BankParsers:
                                     col_x[n] = w["x0"]
                             if len(col_x) >= 4:
                                 break
+                    if len(col_x) >= 4:
+                        break
 
-                    if len(col_x) < 4:
-                        ratio = page_w / 595.276
-                        col_x = {
-                            "DATA":      56.7  * ratio,
-                            "HISTORICO": 155.9 * ratio,
-                            "DOCUMENTO": 388.3 * ratio,
-                            "VALOR":     459.2 * ratio,
-                            "SALDO":     530.2 * ratio,
-                        }
+                if len(col_x) < 4:
+                    ratio = page_w / 595.276
+                    col_x = {
+                        "DATA":      56.7  * ratio,
+                        "HISTORICO": 155.9 * ratio,
+                        "DOCUMENTO": 388.3 * ratio,
+                        "VALOR":     459.2 * ratio,
+                        "SALDO":     530.2 * ratio,
+                    }
 
-                    cols_sorted = sorted(col_x.items(), key=lambda c: c[1])
+                cols_sorted = sorted(col_x.items(), key=lambda c: c[1])
 
-                    def x_range(name):
-                        for i, (n, x0) in enumerate(cols_sorted):
-                            if n == name:
-                                end = (cols_sorted[i+1][1]
-                                       if i+1 < len(cols_sorted)
-                                       else page_w)
-                                return (x0 - 2, end - 1)
-                        return None
+                def x_range(name):
+                    for i, (n, x0) in enumerate(cols_sorted):
+                        if n == name:
+                            end = (cols_sorted[i + 1][1]
+                                   if i + 1 < len(cols_sorted)
+                                   else page_w)
+                            return (x0 - 2, end - 1)
+                    return None
 
-                    XD = x_range("DATA")
-                    XH = x_range("HISTORICO")
-                    XV = x_range("VALOR")
+                XD = x_range("DATA")
+                XH = x_range("HISTORICO")
+                XV = x_range("VALOR")
 
-                    if not XD or not XH or not XV:
-                        continue
+                if not XD or not XH or not XV:
+                    return transactions
 
-                    # ── Coleta linhas horizontais da página ──
+                # ══════════════════════════════════════════════════
+                # PASSO 2 — Processar cada página usando linhas
+                # horizontais reais como delimitadores de célula
+                # ══════════════════════════════════════════════════
+                for page in pdf.pages:
+
+                    # Coleta linhas horizontais longas (> 30% da página)
                     h_lines = sorted(set(
                         round(l["top"])
                         for l in page.horizontal_edges
-                        if l["width"] > page_w * 0.3  # linhas longas
+                        if l.get("width", 0) > page_w * 0.3
                     ))
 
                     if len(h_lines) < 2:
                         continue
 
-                    # ── Para cada faixa entre duas linhas horizontais,
-                    #    extrai o texto de cada coluna ──
-                    for i in range(len(h_lines) - 1):
-                        y0 = h_lines[i]
-                        y1 = h_lines[i + 1]
+                    # Detecta y_header e y_footer via palavras da página
+                    words_page = page.extract_words(
+                        x_tolerance=3, y_tolerance=3,
+                        keep_blank_chars=False, use_text_flow=False,
+                    )
+                    by_y_pg = defaultdict(list)
+                    for w in words_page:
+                        by_y_pg[round(w["top"])].append(w)
 
-                        if y1 - y0 < 5:   # faixa muito fina → ignora
+                    y_header_line = None
+                    y_footer_line = page.height
+
+                    for y_key in sorted(by_y_pg):
+                        row_norms = [norm(w["text"])
+                                     for w in by_y_pg[y_key]]
+                        joined    = " ".join(row_norms)
+
+                        if "DATA" in row_norms and "VALOR" in row_norms:
+                            for hl in h_lines:
+                                if hl > y_key:
+                                    y_header_line = hl
+                                    break
+
+                        if y_header_line and any(
+                            norm(s) in joined for s in [
+                                "SALDO DE CONTA", "SALDO BLOQUEADO",
+                                "SALDO DISPONIVEL", "A - SALDO",
+                                "B - SALDO", "C - SALDO",
+                                "BLOQUEIO DIA",
+                                "LANCAMENTO PROVISIONADO",
+                                "CENTRAL DE ATENDIMENTO",
+                            ]
+                        ):
+                            for hl in reversed(h_lines):
+                                if hl < y_key:
+                                    y_footer_line = hl
+                                    break
+                            break
+
+                    if y_header_line is None:
+                        continue
+
+                    # Filtra linhas horizontais na área útil
+                    area_lines = [
+                        hl for hl in h_lines
+                        if y_header_line <= hl <= y_footer_line
+                    ]
+
+                    if len(area_lines) < 2:
+                        continue
+
+                    # Para cada faixa entre duas linhas horizontais
+                    def cell_text(x_rng, y_top, y_bot):
+                        try:
+                            crop = page.within_bbox(
+                                (x_rng[0], y_top, x_rng[1], y_bot))
+                            t = crop.extract_text(
+                                x_tolerance=3, y_tolerance=3) or ""
+                            # Colapsa qualquer quebra de linha
+                            return " ".join(t.split())
+                        except Exception:
+                            return ""
+
+                    for i in range(len(area_lines) - 1):
+                        y0 = area_lines[i]
+                        y1 = area_lines[i + 1]
+
+                        if y1 - y0 < 4:
                             continue
-                        if y1 - y0 > 200: # faixa muito larga → ignora
+                        if y1 - y0 > 300:
                             continue
 
-                        def cell_text(x_rng):
-                            try:
-                                crop = page.within_bbox(
-                                    (x_rng[0], y0, x_rng[1], y1))
-                                t = crop.extract_text(
-                                    x_tolerance=3, y_tolerance=3) or ""
-                                return " ".join(t.split())
-                            except Exception:
-                                return ""
+                        date_raw = cell_text(XD, y0, y1)
+                        hist_raw = cell_text(XH, y0, y1)
+                        val_raw  = cell_text(XV, y0, y1)
 
-                        date_raw = cell_text(XD)
-                        hist_raw = cell_text(XH)
-                        val_raw  = cell_text(XV)
-
-                        # Limpa flag da célula de data
+                        # Limpa data: remove flag (a/b/p)
                         date_clean = re.sub(
                             r"\s*[abpABP]\s*$", "", date_raw).strip()
                         date_clean = re.sub(
                             r"^[abpABP]\s+", "", date_clean).strip()
 
-                        # Limpa histórico: remove doc e valores
-                        hist_tokens = hist_raw.split()
-                        hist_clean  = []
-                        for t in hist_tokens:
-                            if RE_DOC.match(t):
-                                continue
-                            if RE_VALUE.match(t):
-                                continue
-                            if RE_FLAG.fullmatch(t):
-                                continue
-                            hist_clean.append(t)
+                        # Limpa histórico
+                        hist_str = clean_hist(hist_raw)
+                        hist_tokens = hist_str.split()
+                        hist_clean  = [
+                            t for t in hist_tokens
+                            if not RE_DOC.match(t)
+                            and not RE_VALUE.match(t)
+                            and not RE_FLAG.fullmatch(t)
+                        ]
                         hist_str = " ".join(hist_clean).strip()
 
-                        # Pega primeiro valor numérico da célula VAL
+                        # Primeiro valor numérico válido
                         val_str = ""
                         for tok in val_raw.split():
-                            tok_clean = tok.replace(" ", "")
-                            if RE_VALUE.match(tok_clean):
-                                val_str = tok_clean
+                            if RE_VALUE.match(tok):
+                                val_str = tok
                                 break
 
                         # Validações
@@ -392,6 +327,7 @@ class BankParsers:
         except Exception:
             import traceback
             traceback.print_exc()
+            return []
 
         return transactions
 
@@ -760,17 +696,17 @@ if uploaded_file is not None:
             else:
                 transactions.sort(key=lambda x: x["date_obj"])
 
-                pdf_initial = BankParsers._extract_initial_balance(
+                pdf_initial     = BankParsers._extract_initial_balance(
                     text_lines)
                 initial_balance = (manual_initial_balance
                                    if manual_initial_balance != 0.0
                                    else pdf_initial)
-                total_credits = sum(t["amount"] for t in transactions
-                                    if t["amount"] > 0)
-                total_debits  = sum(t["amount"] for t in transactions
-                                    if t["amount"] < 0)
-                final_balance = (initial_balance
-                                 + total_credits + total_debits)
+                total_credits   = sum(t["amount"] for t in transactions
+                                      if t["amount"] > 0)
+                total_debits    = sum(t["amount"] for t in transactions
+                                      if t["amount"] < 0)
+                final_balance   = (initial_balance
+                                   + total_credits + total_debits)
 
                 st.markdown("---")
                 st.subheader("📊 Resumo Financeiro da Conta")
