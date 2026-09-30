@@ -93,7 +93,6 @@ class BankParsers:
         norm = BankParsers._normalize
 
         def clean_hist(raw):
-            """Colapsa quebras de linha e espaços múltiplos."""
             text = re.sub(r"[\r\n]+", " ", raw)
             text = re.sub(r"\s{2,}", " ", text)
             text = re.sub(r"^[abpABP]\s+", "", text).strip()
@@ -181,114 +180,134 @@ class BankParsers:
                     return transactions
 
                 # ══════════════════════════════════════════════════
-                # PASSO 2 — Processar cada página usando linhas
-                # horizontais reais como delimitadores de célula
+                # PASSO 2 — Agrupar palavras por linha (Y próximo)
+                # e reconstruir blocos de transação
                 # ══════════════════════════════════════════════════
                 for page in pdf.pages:
 
-                    # Coleta linhas horizontais longas (> 30% da página)
-                    h_lines = sorted(set(
-                        round(l["top"])
-                        for l in page.horizontal_edges
-                        if l.get("width", 0) > page_w * 0.3
-                    ))
-
-                    if len(h_lines) < 2:
-                        continue
-
-                    # Detecta y_header e y_footer via palavras da página
-                    words_page = page.extract_words(
+                    words = page.extract_words(
                         x_tolerance=3, y_tolerance=3,
                         keep_blank_chars=False, use_text_flow=False,
                     )
-                    by_y_pg = defaultdict(list)
-                    for w in words_page:
-                        by_y_pg[round(w["top"])].append(w)
 
-                    y_header_line = None
-                    y_footer_line = page.height
+                    if not words:
+                        continue
 
-                    for y_key in sorted(by_y_pg):
-                        row_norms = [norm(w["text"])
-                                     for w in by_y_pg[y_key]]
+                    # Agrupa palavras em linhas por proximidade de Y (±4pt)
+                    Y_TOL = 4
+                    rows  = []   # lista de (y_center, [words])
+                    for w in sorted(words, key=lambda x: x["top"]):
+                        placed = False
+                        for row in rows:
+                            if abs(w["top"] - row[0]) <= Y_TOL:
+                                row[1].append(w)
+                                row[0] = (row[0] + w["top"]) / 2
+                                placed = True
+                                break
+                        if not placed:
+                            rows.append([w["top"], [w]])
+
+                    # Detecta y_header e y_footer
+                    y_header = None
+                    y_footer = page.height
+
+                    for y_c, row_words in rows:
+                        row_norms = [norm(rw["text"]) for rw in row_words]
                         joined    = " ".join(row_norms)
 
-                        # Linha de cabeçalho da tabela
                         if "DATA" in row_norms and "VALOR" in row_norms:
-                            for hl in h_lines:
-                                if hl > y_key:
-                                    y_header_line = hl
-                                    break
+                            y_header = y_c
+                            continue
 
-                        # Início do rodapé
-                        if y_header_line and any(
+                        if y_header and any(
                             norm(s) in joined for s in [
-                                "SALDO DE CONTA",
-                                "SALDO BLOQUEADO",
-                                "SALDO DISPONIVEL",
-                                "A - SALDO",
-                                "B - SALDO",
-                                "C - SALDO",
+                                "SALDO DE CONTA", "SALDO BLOQUEADO",
+                                "SALDO DISPONIVEL", "A - SALDO",
+                                "B - SALDO", "C - SALDO",
                                 "BLOQUEIO DIA",
                                 "LANCAMENTO PROVISIONADO",
                                 "CENTRAL DE ATENDIMENTO",
                             ]
                         ):
-                            for hl in reversed(h_lines):
-                                if hl < y_key:
-                                    y_footer_line = hl
-                                    break
+                            y_footer = y_c
                             break
 
-                    if y_header_line is None:
+                    if y_header is None:
                         continue
 
-                    # Filtra linhas horizontais na área útil
-                    area_lines = [
-                        hl for hl in h_lines
-                        if y_header_line <= hl <= y_footer_line
+                    # Filtra apenas linhas da área útil
+                    data_rows = [
+                        (y_c, rw)
+                        for y_c, rw in rows
+                        if y_c > y_header and y_c < y_footer
                     ]
 
-                    if len(area_lines) < 2:
-                        continue
+                    # ── Classifica cada palavra na sua coluna ──────
+                    def col_of(word):
+                        x = word["x0"]
+                        # Encontra a coluna mais próxima à esquerda
+                        best = None
+                        for name, cx in cols_sorted:
+                            if x >= cx - 5:
+                                best = name
+                            else:
+                                break
+                        return best
 
-                    # Helper: extrai texto de uma bbox e colapsa \n
-                    def cell_text(x_rng, y_top, y_bot):
-                        try:
-                            crop = page.within_bbox(
-                                (x_rng[0], y_top,
-                                 x_rng[1], y_bot))
-                            t = crop.extract_text(
-                                x_tolerance=3,
-                                y_tolerance=3) or ""
-                            # ── CORREÇÃO PRINCIPAL ──
-                            return " ".join(t.split())
-                        except Exception:
-                            return ""
+                    # ── Monta blocos de transação ──────────────────
+                    # Cada bloco começa numa linha que tem DATA
+                    # e pode continuar em linhas sem DATA (continuação
+                    # do histórico multilinha).
+                    blocks = []   # lista de dicts
+                    current = None
 
-                    # Processa cada faixa entre duas linhas horizontais
-                    for i in range(len(area_lines) - 1):
-                        y0 = area_lines[i]
-                        y1 = area_lines[i + 1]
+                    for y_c, row_words in data_rows:
+                        # Separa palavras por coluna
+                        by_col = defaultdict(list)
+                        for w in row_words:
+                            c = col_of(w)
+                            if c:
+                                by_col[c].append(w["text"])
 
-                        # Ignora faixas muito finas ou muito largas
-                        if y1 - y0 < 4:
-                            continue
-                        if y1 - y0 > 300:
-                            continue
+                        date_tokens = by_col.get("DATA", [])
+                        hist_tokens = by_col.get("HISTORICO", [])
+                        val_tokens  = by_col.get("VALOR", [])
 
-                        date_raw = cell_text(XD, y0, y1)
-                        hist_raw = cell_text(XH, y0, y1)
-                        val_raw  = cell_text(XV, y0, y1)
+                        # Remove flag (a/b/p) da data
+                        date_clean_tokens = [
+                            t for t in date_tokens
+                            if not RE_FLAG.fullmatch(t)
+                        ]
+                        date_str = " ".join(date_clean_tokens).strip()
 
-                        # Limpa data: remove flag (a/b/p)
-                        date_clean = re.sub(
-                            r"\s*[abpABP]\s*$", "", date_raw).strip()
-                        date_clean = re.sub(
-                            r"^[abpABP]\s+", "", date_clean).strip()
+                        # Verifica se é início de novo lançamento
+                        is_new = RE_DATE.match(date_str)
 
-                        # Limpa histórico em linha única
-                        hist_str    = clean_hist(hist_raw)
+                        if is_new:
+                            if current:
+                                blocks.append(current)
+                            current = {
+                                "date":  date_str,
+                                "hist":  list(hist_tokens),
+                                "value": list(val_tokens),
+                            }
+                        else:
+                            # Continuação: acumula histórico
+                            if current is not None:
+                                current["hist"].extend(hist_tokens)
+                                if not current["value"]:
+                                    current["value"].extend(val_tokens)
+
+                    if current:
+                        blocks.append(current)
+
+                    # ── Processa cada bloco ────────────────────────
+                    for blk in blocks:
+                        date_str = blk["date"]
+                        hist_str = clean_hist(" ".join(blk["hist"]))
+                        val_raw  = " ".join(blk["value"])
+
+                        # Filtra tokens inválidos do histórico
                         hist_tokens = hist_str.split()
                         hist_clean  = [
                             t for t in hist_tokens
@@ -298,7 +317,7 @@ class BankParsers:
                         ]
                         hist_str = " ".join(hist_clean).strip()
 
-                        # Primeiro valor numérico válido = lançamento
+                        # Primeiro valor numérico válido
                         val_str = ""
                         for tok in val_raw.split():
                             if RE_VALUE.match(tok):
@@ -306,7 +325,7 @@ class BankParsers:
                                 break
 
                         # Validações
-                        if not RE_DATE.match(date_clean):
+                        if not RE_DATE.match(date_str):
                             continue
                         if not val_str:
                             continue
@@ -319,7 +338,7 @@ class BankParsers:
                         if is_invalid_desc(hist_str):
                             continue
 
-                        dt_obj = BankParsers._parse_date(date_clean)
+                        dt_obj = BankParsers._parse_date(date_str)
                         if not dt_obj:
                             continue
 
