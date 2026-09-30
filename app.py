@@ -109,24 +109,26 @@ class BankParsers:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
                 # ══════════════════════════════════════════════════════
-                # PASSO 1 — Detectar coordenadas X reais das colunas
-                # Estratégia: encontra a linha de cabeçalho e mede
-                # o x0 de cada palavra-chave
+                # PASSO 1 — Detectar coordenadas X reais do cabeçalho
+                # Lê todas as palavras da página e encontra a linha
+                # que contém "Data" e "Valor" simultaneamente
                 # ══════════════════════════════════════════════════════
-                col_x = {}
+                col_x   = {}
+                page_w  = pdf.pages[0].width   # largura real da página
 
                 for page in pdf.pages:
                     words = page.extract_words(
-                        x_tolerance=4, y_tolerance=3,
+                        x_tolerance=3, y_tolerance=3,
                         keep_blank_chars=False,
                         use_text_flow=False,
                     )
+                    # Agrupa por Y (1pt de tolerância)
                     by_y = defaultdict(list)
                     for w in words:
                         by_y[round(w["top"])].append(w)
 
                     for y_key in sorted(by_y):
-                        row = by_y[y_key]
+                        row   = by_y[y_key]
                         norms = [norm(w["text"]) for w in row]
                         if "DATA" in norms and "VALOR" in norms:
                             for w in row:
@@ -139,67 +141,62 @@ class BankParsers:
                     if len(col_x) >= 4:
                         break
 
-                # ── DEBUG: imprime as coordenadas detectadas ──
-                print(f"[DEBUG] col_x detectado: {col_x}")
-
-                # Fallback com coordenadas REAIS medidas do PDF Santander IB
-                # (medidas via pdfplumber.open + extract_words no cabeçalho)
-                # Valores em pontos PDF (pt), página A4 ~595pt largura
+                # Fallback: proporções reais do PDF Santander IB
+                # (página ~841pt altura × ~595pt largura em A4)
+                # Cabeçalho medido: Data≈55, Histórico≈196,
+                #                   Documento≈421, Valor≈519, Saldo≈638
                 if len(col_x) < 4:
+                    ratio = page_w / 595.0   # escala relativa ao A4
                     col_x = {
-                        "DATA":      55.0,
-                        "HISTORICO": 196.0,
-                        "DOCUMENTO": 421.0,
-                        "VALOR":     584.0,
-                        "SALDO":     714.0,
+                        "DATA":      55.0  * ratio,
+                        "HISTORICO": 196.0 * ratio,
+                        "DOCUMENTO": 421.0 * ratio,
+                        "VALOR":     519.0 * ratio,
+                        "SALDO":     638.0 * ratio,
                     }
-                    print(f"[DEBUG] Usando fallback de coordenadas: {col_x}")
 
-                # Monta intervalos [x_start, x_end) para cada coluna
+                # Monta intervalos de cada coluna
                 cols_sorted = sorted(col_x.items(), key=lambda c: c[1])
-                print(f"[DEBUG] cols_sorted: {cols_sorted}")
 
                 def col_range(name):
                     for i, (n, x0) in enumerate(cols_sorted):
                         if n == name:
                             start = x0 - 10
                             end   = (cols_sorted[i + 1][1] - 2
-                                     if i + 1 < len(cols_sorted) else 9999)
+                                     if i + 1 < len(cols_sorted)
+                                     else page_w + 10)
                             return (start, end)
                     return None
 
                 R_DATE = col_range("DATA")      or (45,   186)
                 R_HIST = col_range("HISTORICO") or (186,  411)
-                R_DOC  = col_range("DOCUMENTO") or (411,  574)
-                R_VAL  = col_range("VALOR")     or (574,  704)
+                R_DOC  = col_range("DOCUMENTO") or (411,  509)
+                R_VAL  = col_range("VALOR")     or (509,  628)
                 # Saldo: x0 >= R_VAL[1]
 
-                print(f"[DEBUG] R_DATE={R_DATE} R_HIST={R_HIST} "
-                      f"R_DOC={R_DOC} R_VAL={R_VAL}")
-
                 # ══════════════════════════════════════════════════════
-                # PASSO 2 — Processar cada página com extract_words
+                # PASSO 2 — Processar cada página
+                # Estratégia: agrupa palavras por linha (Y),
+                # identifica blocos de lançamento pelo aparecimento
+                # de uma DATA válida na coluna DATE.
+                # Linhas sem DATA são continuação do bloco anterior.
                 # ══════════════════════════════════════════════════════
-                for page_num, page in enumerate(pdf.pages):
+                for page in pdf.pages:
                     words = page.extract_words(
-                        x_tolerance=4, y_tolerance=3,
+                        x_tolerance=3, y_tolerance=3,
                         keep_blank_chars=False,
                         use_text_flow=False,
                     )
                     if not words:
                         continue
 
-                    print(f"\n[DEBUG] Página {page_num + 1}: "
-                          f"{len(words)} palavras extraídas")
-
-                    # Agrupa palavras por linha (Y arredondado a 2pt)
+                    # Agrupa por Y arredondado a 2pt
                     by_y = defaultdict(list)
                     for w in words:
                         by_y[round(w["top"] / 2) * 2].append(w)
 
                     sorted_ys = sorted(by_y.keys())
 
-                    # Classifica cada palavra na sua coluna
                     def classify(w):
                         x0 = w["x0"]
                         if R_DATE[0] <= x0 < R_DATE[1]:
@@ -214,10 +211,9 @@ class BankParsers:
                             return "SALDO"
                         return "OTHER"
 
-                    # ── Agrupa linhas em blocos de lançamento ──
-                    # Nova lógica: um bloco começa a cada linha que
-                    # contém uma DATA válida. Linhas sem DATA são
-                    # continuação do bloco anterior (histórico multilinha).
+                    # Agrupa linhas em blocos:
+                    # novo bloco = linha com DATE válida
+                    # continuação = linha sem DATE (histórico multilinha)
                     blocks = []
 
                     for y in sorted_ys:
@@ -228,29 +224,19 @@ class BankParsers:
                             and RE_DATE.match(w["text"])
                             for w in row
                         )
-                        has_val = any(
-                            classify(w) == "VAL"
-                            and RE_VALUE.match(w["text"])
-                            for w in row
-                        )
 
-                        if not blocks:
-                            blocks.append([y])
-                            continue
-
-                        last_block = blocks[-1]
-                        last_y     = last_block[-1]
-                        gap        = y - last_y
-
-                        # Nova linha de lançamento: tem data própria
-                        # OU gap muito grande (mudança de seção)
-                        if has_date or gap > 60:
+                        if not blocks or has_date:
                             blocks.append([y])
                         else:
-                            # Continuação: sem data, perto do bloco anterior
-                            last_block.append(y)
+                            last_y = blocks[-1][-1]
+                            gap    = y - last_y
+                            # Continuação apenas se gap razoável (< 60pt)
+                            if gap < 60:
+                                blocks[-1].append(y)
+                            else:
+                                blocks.append([y])
 
-                    # ── Processa cada bloco ──
+                    # Processa cada bloco
                     for block in blocks:
                         all_words = []
                         for y in block:
@@ -268,16 +254,17 @@ class BankParsers:
                             if col == "DATE":
                                 if RE_DATE.match(t):
                                     date_words.append(w)
-                                # flags (a/b/p) → ignora
+                                # flags (a/b/p) → descarta
 
                             elif col == "HIST":
+                                # Descarta tokens que são doc, valor ou flag
                                 if (not RE_DOC.match(t)
                                         and not RE_VALUE.match(t)
                                         and not RE_FLAG.fullmatch(t)):
                                     hist_words.append(w)
 
                             elif col == "DOC":
-                                pass  # ignora número do documento
+                                pass  # número do documento → ignora
 
                             elif col == "VAL":
                                 if RE_VALUE.match(t):
@@ -287,27 +274,22 @@ class BankParsers:
                         date_str = " ".join(
                             w["text"] for w in date_words).strip()
 
-                        # Reconstrói histórico linha a linha
+                        # Reconstrói histórico linha a linha (ordem Y)
                         hist_by_y = defaultdict(list)
                         for w in hist_words:
                             hist_by_y[round(w["top"] / 2) * 2].append(w)
                         hist_lines = []
                         for hy in sorted(hist_by_y):
-                            lw = sorted(hist_by_y[hy], key=lambda x: x["x0"])
+                            lw = sorted(hist_by_y[hy],
+                                        key=lambda x: x["x0"])
                             hist_lines.append(
                                 " ".join(w["text"] for w in lw))
                         hist_str = " ".join(hist_lines).strip()
 
-                        # Primeiro valor = lançamento; segundo = saldo
+                        # Primeiro valor da coluna VAL = lançamento
+                        # Segundo valor (se existir) = saldo → ignora
                         val_str = (val_words[0]["text"].strip()
                                    if val_words else "")
-
-                        # Debug de cada bloco
-                        if date_str or hist_str or val_str:
-                            print(f"  BLOCO y={block[0]:4d}-{block[-1]:4d} | "
-                                  f"date='{date_str}' | "
-                                  f"hist='{hist_str[:40]}' | "
-                                  f"val='{val_str}'")
 
                         # ── Validações ──
                         if not RE_DATE.match(date_str):
@@ -338,8 +320,6 @@ class BankParsers:
                             "amount":      val,
                             "description": hist_str,
                         })
-
-                print(f"\n[DEBUG] Total de transações: {len(transactions)}")
 
         except Exception:
             import traceback
@@ -704,12 +684,12 @@ if uploaded_file is not None:
 
             if not transactions:
                 with st.expander(
-                        "🔍 Debug — linhas extraídas do PDF (primeiras 80)"):
+                        "🔍 Debug — linhas extraídas (primeiras 80)"):
                     for i, l in enumerate(text_lines[:80]):
                         st.text(f"{i:03d}: {l}")
                 st.error(
                     "Nenhum lançamento identificado. "
-                    "Veja o debug acima para diagnóstico.")
+                    "Veja o debug acima.")
             else:
                 transactions.sort(key=lambda x: x["date_obj"])
 
@@ -785,6 +765,14 @@ if uploaded_file is not None:
                     use_container_width=True,
                     height=table_height,
                 )
+
+                # ── Expander com debug dos lançamentos capturados ──
+                with st.expander("🔍 Debug — lançamentos capturados"):
+                    for t in transactions:
+                        st.text(
+                            f"{t['date_obj'].strftime('%d/%m/%Y')} | "
+                            f"{t['amount']:>12.2f} | "
+                            f"{t['description']}")
 
         except Exception as e:
             st.error(f"Erro ao processar o PDF: {str(e)}")
