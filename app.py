@@ -13,10 +13,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# ==========================================
-# 1. PARSERS ESPECÍFICOS POR BANCO
-# ==========================================
-
 class BankParsers:
 
     @staticmethod
@@ -51,6 +47,94 @@ class BankParsers:
         return 0.0
 
     @staticmethod
+    def _detect_columns_santander(pdf_bytes):
+        """
+        Faz uma passagem prévia em todas as páginas do PDF para detectar
+        automaticamente as coordenadas X de cada coluna, localizando os
+        cabeçalhos: Data, Histórico, Documento, Valor, Saldo.
+        Retorna um dict com as bordas de cada coluna.
+        """
+        HEADER_TERMS = {
+            "data":       ["DATA"],
+            "historico":  ["HISTÓRICO", "HISTORICO"],
+            "documento":  ["DOCUMENTO"],
+            "valor":      ["VALOR"],
+            "saldo":      ["SALDO"],
+        }
+
+        found = {}  # col_name -> x0 do cabeçalho
+
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(
+                    x_tolerance=3,
+                    y_tolerance=3,
+                    keep_blank_chars=False,
+                    use_text_flow=False,
+                )
+                if not words:
+                    continue
+
+                # Agrupa palavras por linha Y
+                lines_by_y = defaultdict(list)
+                for w in words:
+                    y_key = round(w["top"] / 3) * 3
+                    lines_by_y[y_key].append(w)
+
+                # Procura a linha de cabeçalho que contenha pelo menos
+                # "DATA" e "VALOR" juntos
+                for y in sorted(lines_by_y.keys()):
+                    row = lines_by_y[y]
+                    texts_upper = [w["text"].upper() for w in row]
+
+                    # Verifica se esta linha é o cabeçalho da tabela
+                    has_data  = any(t in ["DATA"] for t in texts_upper)
+                    has_valor = any(t in ["VALOR"] for t in texts_upper)
+
+                    if has_data and has_valor:
+                        # Encontrou o cabeçalho — mapeia cada coluna
+                        for w in row:
+                            tu = w["text"].upper()
+                            for col, terms in HEADER_TERMS.items():
+                                if tu in terms and col not in found:
+                                    found[col] = w["x0"]
+                        break  # Só precisa da primeira ocorrência
+
+                if len(found) >= 4:
+                    break  # Encontrou colunas suficientes
+
+        # Se não encontrou tudo, usa fallback com valores padrão
+        defaults = {
+            "data":      50,
+            "historico": 130,
+            "documento": 390,
+            "valor":     470,
+            "saldo":     570,
+        }
+        for col, val in defaults.items():
+            if col not in found:
+                found[col] = val
+
+        # Ordena por x0 para garantir a sequência correta
+        cols_sorted = sorted(found.items(), key=lambda x: x[1])
+
+        # Monta bordas: cada coluna vai do seu x0 até o x0 da próxima
+        # com uma margem de segurança de 5pt
+        col_order = [c[0] for c in cols_sorted]
+        col_x0    = {c[0]: c[1] for c in cols_sorted}
+
+        borders = {}
+        for i, col in enumerate(col_order):
+            x_min = col_x0[col] - 5  # margem esquerda
+            if i + 1 < len(col_order):
+                x_max = col_x0[col_order[i + 1]] - 5
+            else:
+                x_max = 9999  # última coluna vai até o fim
+            borders[col] = (x_min, x_max)
+
+        return borders
+
+    @staticmethod
     def santander(text_lines, pdf_bytes=None):
 
         SKIP_TERMS = [
@@ -71,7 +155,6 @@ class BankParsers:
             "V&T", "DATA/HORA",
         ]
 
-        # Linhas de zeramento automático — ignorar completamente
         IGNORE_HIST = [
             "RESGATE CONTAMAX",
             "APLICACAO CONTAMAX",
@@ -102,21 +185,14 @@ class BankParsers:
 
         if pdf_bytes:
             try:
-                # ── Limites de coluna do Santander (em pontos PDF) ──
-                # Inspecionado no PDF real:
-                #   Data       ~  50 – 135
-                #   Histórico  ~ 135 – 415
-                #   Documento  ~ 415 – 490
-                #   Valor      ~ 490 – 590   ← coluna "Valor" (vermelho/preto)
-                #   Saldo      ~ 590+         ← ignorado
-                X_DATE_MIN =  50
-                X_DATE_MAX = 135
-                X_HIST_MIN = 135
-                X_HIST_MAX = 415
-                X_DOC_MIN  = 415
-                X_DOC_MAX  = 490
-                X_VAL_MIN  = 490
-                X_VAL_MAX  = 590
+                # ── PASSO 1: detecta colunas automaticamente ──
+                borders = BankParsers._detect_columns_santander(pdf_bytes)
+
+                X_DATE_MIN, X_DATE_MAX = borders.get("data",      (50,  130))
+                X_HIST_MIN, X_HIST_MAX = borders.get("historico", (130, 390))
+                X_DOC_MIN,  X_DOC_MAX  = borders.get("documento", (390, 470))
+                X_VAL_MIN,  X_VAL_MAX  = borders.get("valor",     (470, 570))
+                # Coluna saldo: x >= X_VAL_MAX → ignorada automaticamente
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
@@ -129,25 +205,21 @@ class BankParsers:
                         if not words:
                             continue
 
-                        # ── Passo 1: agrupa palavras por Y com tolerância fina ──
+                        # ── PASSO 2: agrupa por Y (tolerância fina 3pt) ──
                         raw_lines = defaultdict(list)
                         for w in words:
                             y_key = round(w["top"] / 3) * 3
                             raw_lines[y_key].append(w)
 
-                        # ── Passo 2: mescla sub-linhas próximas (até 18pt) ──
-                        # O Santander quebra o histórico em sub-linhas dentro
-                        # da mesma célula. Cada célula tem ~30-35pt de altura,
-                        # sub-linhas ficam a ~12-15pt de distância.
-                        # Mesclamos sub-linhas consecutivas que NÃO têm data
-                        # nem valor — elas pertencem ao lançamento anterior.
-                        sorted_ys  = sorted(raw_lines.keys())
-                        groups     = []   # lista de (y_ref, [words])
+                        # ── PASSO 3: mescla sub-linhas de histórico ──
+                        # Sub-linhas do mesmo lançamento ficam a ~10-18pt
+                        # de distância e NÃO têm data nem valor próprios.
+                        sorted_ys = sorted(raw_lines.keys())
+                        groups = []  # lista de (y_ref, [words])
 
                         for y in sorted_ys:
                             row_words = sorted(raw_lines[y], key=lambda w: w["x0"])
 
-                            # Verifica se esta sub-linha tem data ou valor
                             has_date = any(
                                 X_DATE_MIN <= w["x0"] < X_DATE_MAX
                                 and RE_DATE_FULL.match(w["text"])
@@ -166,10 +238,9 @@ class BankParsers:
                             last_y, last_words = groups[-1]
                             gap = y - last_y
 
-                            # Se a sub-linha está próxima (≤18pt) e não tem
-                            # data nem valor próprios → é continuação de histórico
-                            if gap <= 18 and not has_date and not has_val:
-                                # Adiciona apenas as palavras de histórico
+                            # Linha de continuação: próxima (≤20pt),
+                            # sem data e sem valor → funde ao grupo anterior
+                            if gap <= 20 and not has_date and not has_val:
                                 hist_words = [
                                     w for w in row_words
                                     if X_HIST_MIN <= w["x0"] < X_HIST_MAX
@@ -179,7 +250,7 @@ class BankParsers:
                             else:
                                 groups.append((y, list(row_words)))
 
-                        # ── Passo 3: processa cada grupo como uma linha lógica ──
+                        # ── PASSO 4: processa cada grupo como linha lógica ──
                         p_date = None
                         p_desc = []
 
@@ -230,13 +301,14 @@ class BankParsers:
                                 if X_DATE_MIN <= x0 < X_DATE_MAX:
                                     date_tokens.append(text)
                                 elif X_HIST_MIN <= x0 < X_HIST_MAX:
-                                    if not RE_FLAG.match(text) and not RE_DOC.match(text):
+                                    if (not RE_FLAG.match(text)
+                                            and not RE_DOC.match(text)):
                                         hist_tokens.append(text)
                                 elif X_DOC_MIN <= x0 < X_DOC_MAX:
-                                    pass  # documento: ignorado
+                                    pass  # documento ignorado
                                 elif X_VAL_MIN <= x0 < X_VAL_MAX:
                                     val_tokens.append(text)
-                                # x0 >= X_VAL_MAX → coluna Saldo → ignora
+                                # x0 >= X_VAL_MAX → saldo → ignora
 
                             date_str = " ".join(date_tokens).strip()
                             hist_str = " ".join(hist_tokens).strip()
@@ -245,31 +317,28 @@ class BankParsers:
                             is_date  = bool(RE_DATE_FULL.match(date_str))
                             is_value = bool(val_str and RE_VALUE.match(val_str))
 
-                            # Filtra cabeçalhos/rodapés
                             combined = (date_str + " " + hist_str).upper()
                             if is_skip(combined):
                                 discard_pending()
                                 continue
 
-                            # Ignora linhas de zeramento CONTAMAX
                             if hist_str and is_ignore(hist_str):
                                 discard_pending()
                                 continue
 
-                            # Remove flag solta (a/b/p)
                             if hist_str and RE_FLAG.match(hist_str.strip()):
                                 hist_str = ""
 
                             # ── Máquina de estados ──
 
                             if is_date and hist_str and is_value:
-                                # Linha completa
                                 discard_pending()
                                 dt_obj = BankParsers._parse_date(date_str)
                                 if dt_obj and not is_invalid_desc(hist_str):
                                     try:
                                         val = float(
-                                            val_str.replace(".", "").replace(",", ".")
+                                            val_str.replace(".", "")
+                                                   .replace(",", ".")
                                         )
                                         transactions.append({
                                             "date_obj":    dt_obj,
@@ -280,36 +349,29 @@ class BankParsers:
                                         pass
 
                             elif is_date and hist_str and not is_value:
-                                # Início de lançamento: tem data+hist mas valor
-                                # ainda não apareceu
                                 discard_pending()
                                 p_date = date_str
                                 p_desc = [hist_str]
 
                             elif is_date and not hist_str and is_value:
-                                # Data + valor sem histórico → fecha pending
                                 if p_date:
                                     save_pending(val_str)
                                 else:
                                     discard_pending()
 
                             elif is_date and not hist_str and not is_value:
-                                # Só data (linha de flag/doc)
                                 pass
 
                             elif not is_date and hist_str and is_value:
-                                # Continuação com valor → fecha
                                 if p_date:
                                     p_desc.append(hist_str)
                                     save_pending(val_str)
 
                             elif not is_date and hist_str and not is_value:
-                                # Continuação de histórico puro
                                 if p_date:
                                     p_desc.append(hist_str)
 
                             elif not is_date and not hist_str and is_value:
-                                # Só valor → fecha pending
                                 if p_date:
                                     save_pending(val_str)
 
@@ -539,122 +601,47 @@ def detect_bank(text_lines):
     header_text = " ".join(text_lines[:40]).upper()
 
     BANK_SIGNATURES = [
-        (
-            "Santander (033)", [
-                ("SANTANDER", 3),
-                ("CONTAMAX", 5),
-                ("INTERNET BANKING EMPRESARIAL", 4),
-                ("BLOQUEIO DIA", 3),
-                ("4004 2125", 4),
-                ("0800 702 2125", 4),
-            ]
-        ),
-        (
-            "Itaú Unibanco (341)", [
-                ("ITAU UNIBANCO", 5),
-                ("BANCO ITAU", 4),
-                ("ITAÚ UNIBANCO", 5),
-                ("ITOKEN", 4),
-                ("0300 789 8484", 4),
-            ]
-        ),
-        (
-            "Bradesco (237)", [
-                ("BANCO BRADESCO", 5),
-                ("BRADESCO S.A", 5),
-                ("BRADESCO PRIME", 4),
-                ("BRADESCO", 3),
-                ("0800 704 8383", 4),
-            ]
-        ),
-        (
-            "Banco do Brasil (001)", [
-                ("BANCO DO BRASIL", 5),
-                ("BB.COM.BR", 5),
-                ("0800 729 0722", 4),
-                ("AGENCIA BB", 3),
-                ("AGÊNCIA BB", 3),
-            ]
-        ),
-        (
-            "Caixa Econômica Federal (104)", [
-                ("CAIXA ECONOMICA FEDERAL", 5),
-                ("CAIXA ECONÔMICA FEDERAL", 5),
-                ("CEF", 2),
-                ("0800 726 0101", 4),
-                ("CAIXA.GOV", 4),
-            ]
-        ),
-        (
-            "Sicoob (756)", [
-                ("SICOOB", 5),
-                ("0800 642 2200", 4),
-            ]
-        ),
-        (
-            "Sicredi (748)", [
-                ("SICREDI", 5),
-                ("0800 724 7220", 4),
-            ]
-        ),
-        (
-            "Banco Inter (077)", [
-                ("BANCO INTER", 5),
-                ("INTER S.A", 4),
-                ("CONTA DIGITAL INTER", 5),
-            ]
-        ),
-        (
-            "Nubank (260)", [
-                ("NUBANK", 5),
-                ("NU PAGAMENTOS", 5),
-                ("NUCONTA", 4),
-            ]
-        ),
-        (
-            "C6 Bank (336)", [
-                ("C6 BANK", 5),
-                ("C6 S.A", 4),
-            ]
-        ),
-        (
-            "Banrisul (041)", [
-                ("BANRISUL", 5),
-                ("BANCO DO ESTADO DO RIO GRANDE", 4),
-            ]
-        ),
-        (
-            "Stone Pagamentos (197)", [
-                ("STONE PAGAMENTOS", 5),
-                ("STONECO", 4),
-            ]
-        ),
-        (
-            "Unicred (136)", [
-                ("UNICRED", 5),
-            ]
-        ),
-        (
-            "Mercado Pago (323)", [
-                ("MERCADO PAGO", 5),
-                ("MERCADOPAGO", 5),
-            ]
-        ),
+        ("Santander (033)", [
+            ("SANTANDER", 3), ("CONTAMAX", 5),
+            ("INTERNET BANKING EMPRESARIAL", 4), ("BLOQUEIO DIA", 3),
+            ("4004 2125", 4), ("0800 702 2125", 4),
+        ]),
+        ("Itaú Unibanco (341)", [
+            ("ITAU UNIBANCO", 5), ("BANCO ITAU", 4),
+            ("ITAÚ UNIBANCO", 5), ("ITOKEN", 4), ("0300 789 8484", 4),
+        ]),
+        ("Bradesco (237)", [
+            ("BANCO BRADESCO", 5), ("BRADESCO S.A", 5),
+            ("BRADESCO PRIME", 4), ("BRADESCO", 3), ("0800 704 8383", 4),
+        ]),
+        ("Banco do Brasil (001)", [
+            ("BANCO DO BRASIL", 5), ("BB.COM.BR", 5),
+            ("0800 729 0722", 4), ("AGENCIA BB", 3), ("AGÊNCIA BB", 3),
+        ]),
+        ("Caixa Econômica Federal (104)", [
+            ("CAIXA ECONOMICA FEDERAL", 5), ("CAIXA ECONÔMICA FEDERAL", 5),
+            ("CEF", 2), ("0800 726 0101", 4), ("CAIXA.GOV", 4),
+        ]),
+        ("Sicoob (756)",   [("SICOOB", 5), ("0800 642 2200", 4)]),
+        ("Sicredi (748)",  [("SICREDI", 5), ("0800 724 7220", 4)]),
+        ("Banco Inter (077)", [
+            ("BANCO INTER", 5), ("INTER S.A", 4), ("CONTA DIGITAL INTER", 5),
+        ]),
+        ("Nubank (260)",   [("NUBANK", 5), ("NU PAGAMENTOS", 5), ("NUCONTA", 4)]),
+        ("C6 Bank (336)",  [("C6 BANK", 5), ("C6 S.A", 4)]),
+        ("Banrisul (041)", [("BANRISUL", 5), ("BANCO DO ESTADO DO RIO GRANDE", 4)]),
+        ("Stone Pagamentos (197)", [("STONE PAGAMENTOS", 5), ("STONECO", 4)]),
+        ("Unicred (136)",  [("UNICRED", 5)]),
+        ("Mercado Pago (323)", [("MERCADO PAGO", 5), ("MERCADOPAGO", 5)]),
     ]
 
     scores = {}
     for bank_key, signatures in BANK_SIGNATURES:
-        total = sum(
-            weight for term, weight in signatures
-            if term in header_text
-        )
+        total = sum(w for t, w in signatures if t in header_text)
         if total > 0:
             scores[bank_key] = total
 
-    if not scores:
-        return None
-
-    return max(scores, key=lambda k: scores[k])
+    return max(scores, key=lambda k: scores[k]) if scores else None
 
 
 # ==========================================
