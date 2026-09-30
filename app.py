@@ -66,6 +66,7 @@ class BankParsers:
             "APLICACAO CONTAMAX",
             "APLICAÇÃO CONTAMAX",
             "RESGATE CONTAMAX AUTOMATICO",
+            "APLICACAO CONTAMAX AUTOMATICO",
         ]
 
         SKIP_PARTIAL = [
@@ -92,6 +93,7 @@ class BankParsers:
         norm = BankParsers._normalize
 
         def clean_hist(raw):
+            """Colapsa quebras de linha e espaços múltiplos."""
             text = re.sub(r"[\r\n]+", " ", raw)
             text = re.sub(r"\s{2,}", " ", text)
             text = re.sub(r"^[abpABP]\s+", "", text).strip()
@@ -211,17 +213,22 @@ class BankParsers:
                                      for w in by_y_pg[y_key]]
                         joined    = " ".join(row_norms)
 
+                        # Linha de cabeçalho da tabela
                         if "DATA" in row_norms and "VALOR" in row_norms:
                             for hl in h_lines:
                                 if hl > y_key:
                                     y_header_line = hl
                                     break
 
+                        # Início do rodapé
                         if y_header_line and any(
                             norm(s) in joined for s in [
-                                "SALDO DE CONTA", "SALDO BLOQUEADO",
-                                "SALDO DISPONIVEL", "A - SALDO",
-                                "B - SALDO", "C - SALDO",
+                                "SALDO DE CONTA",
+                                "SALDO BLOQUEADO",
+                                "SALDO DISPONIVEL",
+                                "A - SALDO",
+                                "B - SALDO",
+                                "C - SALDO",
                                 "BLOQUEIO DIA",
                                 "LANCAMENTO PROVISIONADO",
                                 "CENTRAL DE ATENDIMENTO",
@@ -245,22 +252,26 @@ class BankParsers:
                     if len(area_lines) < 2:
                         continue
 
-                    # Para cada faixa entre duas linhas horizontais
+                    # Helper: extrai texto de uma bbox e colapsa \n
                     def cell_text(x_rng, y_top, y_bot):
                         try:
                             crop = page.within_bbox(
-                                (x_rng[0], y_top, x_rng[1], y_bot))
+                                (x_rng[0], y_top,
+                                 x_rng[1], y_bot))
                             t = crop.extract_text(
-                                x_tolerance=3, y_tolerance=3) or ""
-                            # Colapsa qualquer quebra de linha
+                                x_tolerance=3,
+                                y_tolerance=3) or ""
+                            # ── CORREÇÃO PRINCIPAL ──
                             return " ".join(t.split())
                         except Exception:
                             return ""
 
+                    # Processa cada faixa entre duas linhas horizontais
                     for i in range(len(area_lines) - 1):
                         y0 = area_lines[i]
                         y1 = area_lines[i + 1]
 
+                        # Ignora faixas muito finas ou muito largas
                         if y1 - y0 < 4:
                             continue
                         if y1 - y0 > 300:
@@ -276,8 +287,8 @@ class BankParsers:
                         date_clean = re.sub(
                             r"^[abpABP]\s+", "", date_clean).strip()
 
-                        # Limpa histórico
-                        hist_str = clean_hist(hist_raw)
+                        # Limpa histórico em linha única
+                        hist_str    = clean_hist(hist_raw)
                         hist_tokens = hist_str.split()
                         hist_clean  = [
                             t for t in hist_tokens
@@ -287,7 +298,7 @@ class BankParsers:
                         ]
                         hist_str = " ".join(hist_clean).strip()
 
-                        # Primeiro valor numérico válido
+                        # Primeiro valor numérico válido = lançamento
                         val_str = ""
                         for tok in val_raw.split():
                             if RE_VALUE.match(tok):
