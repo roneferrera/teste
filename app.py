@@ -13,6 +13,7 @@ st.set_page_config(
     layout="wide"
 )
 
+
 class BankParsers:
 
     @staticmethod
@@ -101,33 +102,33 @@ class BankParsers:
         transactions = []
 
         # ══════════════════════════════════════════════════════════
-        # ESTRATÉGIA 1 — extract_tables com linhas reais da tabela
-        # O Santander gera o PDF a partir de HTML com tabela.
-        # extract_tables agrupa sub-linhas de cada célula sozinho.
+        # ESTRATÉGIA 1 — extract_tables (usa bordas reais da tabela)
+        # O Santander gera PDF a partir de HTML com tabela.
+        # extract_tables agrupa sub-linhas de cada célula sozinho,
+        # resolvendo o histórico quebrado em múltiplas linhas.
         # ══════════════════════════════════════════════════════════
         if pdf_bytes:
             try:
                 table_settings = {
-                    "vertical_strategy":   "lines",
-                    "horizontal_strategy": "lines",
-                    "snap_tolerance":       4,
-                    "join_tolerance":       4,
-                    "edge_min_length":      5,
-                    "min_words_vertical":   1,
-                    "min_words_horizontal": 1,
-                    "intersection_tolerance": 5,
+                    "vertical_strategy":      "lines",
+                    "horizontal_strategy":    "lines",
+                    "snap_tolerance":          4,
+                    "join_tolerance":          4,
+                    "edge_min_length":         5,
+                    "min_words_vertical":      1,
+                    "min_words_horizontal":    1,
+                    "intersection_tolerance":  5,
                 }
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
                         tables = page.extract_tables(table_settings)
 
-                        # Fallback de estratégia dentro da página
                         if not tables:
                             tables = page.extract_tables({
                                 "vertical_strategy":   "lines",
                                 "horizontal_strategy": "text",
-                                "snap_tolerance": 4,
+                                "snap_tolerance":       4,
                             })
 
                         for table in (tables or []):
@@ -136,12 +137,9 @@ class BankParsers:
                                     continue
 
                                 cells = [clean(c) for c in row]
-
                                 if not any(cells):
                                     continue
 
-                                # Detecta dinamicamente qual célula é o quê
-                                # baseado no conteúdo, não na posição fixa
                                 date_str = ""
                                 hist_str = ""
                                 val_str  = ""
@@ -149,37 +147,26 @@ class BankParsers:
                                 for cell in cells:
                                     if not cell:
                                         continue
-                                    # Data: dd/mm/aaaa
                                     if RE_DATE_FULL.match(cell) and not date_str:
                                         date_str = cell
-                                    # Documento: só dígitos 5-6 chars
                                     elif RE_DOC.match(cell):
-                                        pass  # ignora
-                                    # Flag: a, b, p
+                                        pass
                                     elif RE_FLAG.match(cell):
-                                        pass  # ignora
-                                    # Valor: número com vírgula (pega o 1º que aparecer)
+                                        pass
                                     elif RE_VALUE.match(cell) and not val_str:
                                         val_str = cell
-                                    # Histórico: texto descritivo (pega o 1º)
                                     elif (len(cell) > 2
                                           and not re.fullmatch(r"[\d\.,\s]+", cell)
                                           and not hist_str):
                                         hist_str = cell
 
-                                # Filtra cabeçalhos/rodapés
                                 combined = (date_str + " " + hist_str).upper()
                                 if is_skip(combined):
                                     continue
-
-                                # Ignora CONTAMAX
                                 if hist_str and is_ignore(hist_str):
                                     continue
-
-                                # Precisa de data + valor + histórico válido
                                 if not date_str or not val_str or not hist_str:
                                     continue
-
                                 if is_invalid_desc(hist_str):
                                     continue
 
@@ -206,50 +193,38 @@ class BankParsers:
                 transactions = []
 
         # ══════════════════════════════════════════════════════════
-        # ESTRATÉGIA 2 — Texto puro via extract_text()
-        # O extract_text() do pdfplumber já junta as sub-linhas
-        # de cada célula com \n. Usamos isso a nosso favor:
-        # cada lançamento multilinhas vira uma linha com \n interno
-        # que o split("\n") quebra — mas o padrão de data no início
-        # permite reagrupar corretamente.
+        # ESTRATÉGIA 2 — extract_text(layout=True)
+        # Preserva estrutura colunar. Reagrupa linhas sem data
+        # como continuação do lançamento anterior.
         # ══════════════════════════════════════════════════════════
         if pdf_bytes and not transactions:
             try:
                 RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
-
                 all_lines = []
+
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
-                        # layout=True preserva melhor a estrutura colunar
-                        text = page.extract_text(layout=True)
-                        if not text:
-                            text = page.extract_text()
+                        text = page.extract_text(layout=True) or page.extract_text()
                         if text:
                             all_lines.extend(text.split("\n"))
 
-                # Reagrupa: linhas sem data são continuação da anterior
                 merged = []
                 for raw in all_lines:
                     s = raw.strip()
-                    if not s:
-                        continue
-                    if is_skip(s):
-                        continue
-                    if is_ignore(s):
+                    if not s or is_skip(s) or is_ignore(s):
                         continue
                     if RE_DATE_START.match(s):
                         merged.append(s)
                     elif merged:
                         merged[-1] += " " + s
 
-                # Padrão: DATA [flag] HISTÓRICO DOCUMENTO VALOR [SALDO]
                 PAT = re.compile(
-                    r"(\d{2}/\d{2}/\d{4})"       # data
-                    r"(?:\s+[abp]\.?)?"           # flag opcional
-                    r"\s+(.+?)"                   # histórico
-                    r"\s+(\d{5,6})"               # documento
-                    r"\s+(-?[\d\.]+,\d{2})"       # valor
-                    r"(?:\s+-?[\d\.]+,\d{2})?",   # saldo (ignora)
+                    r"(\d{2}/\d{2}/\d{4})"
+                    r"(?:\s+[abp]\.?)?"
+                    r"\s+(.+?)"
+                    r"\s+(\d{5,6})"
+                    r"\s+(-?[\d\.]+,\d{2})"
+                    r"(?:\s+-?[\d\.]+,\d{2})?",
                     re.IGNORECASE,
                 )
 
@@ -266,9 +241,7 @@ class BankParsers:
                         dt_obj = BankParsers._parse_date(dt_str)
                         if dt_obj:
                             try:
-                                val = float(
-                                    val_str.replace(".", "").replace(",", ".")
-                                )
+                                val = float(val_str.replace(".", "").replace(",", "."))
                                 transactions.append({
                                     "date_obj":    dt_obj,
                                     "amount":      val,
@@ -284,7 +257,7 @@ class BankParsers:
                 pass
 
         # ══════════════════════════════════════════════════════════
-        # ESTRATÉGIA 3 — text_lines já extraídas (último recurso)
+        # ESTRATÉGIA 3 — text_lines (último recurso)
         # ══════════════════════════════════════════════════════════
         RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
         merged = []
@@ -346,7 +319,10 @@ class BankParsers:
                 val = float(val_str.replace(".", "").replace(",", "."))
                 if tp:
                     val = -abs(val) if tp.upper() == "D" else abs(val)
-                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+                transactions.append({
+                    "date_obj": dt_obj, "amount": val,
+                    "description": desc.strip()
+                })
         return transactions
 
     @staticmethod
@@ -369,7 +345,10 @@ class BankParsers:
                 val = float(val_str.replace(".", "").replace(",", "."))
                 if tp.upper() == "D":
                     val = -abs(val)
-                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+                transactions.append({
+                    "date_obj": dt_obj, "amount": val,
+                    "description": desc.strip()
+                })
         return transactions
 
     @staticmethod
@@ -392,7 +371,10 @@ class BankParsers:
                 val = float(val_str.replace(".", "").replace(",", "."))
                 if signal == "-" or val_str.startswith("-"):
                     val = -abs(val)
-                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+                transactions.append({
+                    "date_obj": dt_obj, "amount": val,
+                    "description": desc.strip()
+                })
         return transactions
 
     @staticmethod
@@ -415,7 +397,10 @@ class BankParsers:
                 val = float(val_str.replace(".", "").replace(",", "."))
                 if tp.upper() == "D":
                     val = -abs(val)
-                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+                transactions.append({
+                    "date_obj": dt_obj, "amount": val,
+                    "description": desc.strip()
+                })
         return transactions
 
     @staticmethod
@@ -438,7 +423,10 @@ class BankParsers:
                 val = float(val_str.replace(".", "").replace(",", "."))
                 if tp and tp.upper() == "D":
                     val = -abs(val)
-                transactions.append({"date_obj": dt_obj, "amount": val, "description": desc.strip()})
+                transactions.append({
+                    "date_obj": dt_obj, "amount": val,
+                    "description": desc.strip()
+                })
         return transactions
 
 
@@ -465,20 +453,20 @@ BYTES_AWARE_PARSERS = {"033"}
 def detect_bank(text_lines):
     header_text = " ".join(text_lines[:40]).upper()
     BANK_SIGNATURES = [
-        ("Santander (033)",            [("SANTANDER",3),("CONTAMAX",5),("INTERNET BANKING EMPRESARIAL",4),("BLOQUEIO DIA",3),("4004 2125",4),("0800 702 2125",4)]),
-        ("Itaú Unibanco (341)",        [("ITAU UNIBANCO",5),("BANCO ITAU",4),("ITAÚ UNIBANCO",5),("ITOKEN",4),("0300 789 8484",4)]),
-        ("Bradesco (237)",             [("BANCO BRADESCO",5),("BRADESCO S.A",5),("BRADESCO PRIME",4),("BRADESCO",3),("0800 704 8383",4)]),
-        ("Banco do Brasil (001)",      [("BANCO DO BRASIL",5),("BB.COM.BR",5),("0800 729 0722",4),("AGENCIA BB",3),("AGÊNCIA BB",3)]),
+        ("Santander (033)",             [("SANTANDER",3),("CONTAMAX",5),("INTERNET BANKING EMPRESARIAL",4),("BLOQUEIO DIA",3),("4004 2125",4),("0800 702 2125",4)]),
+        ("Itaú Unibanco (341)",         [("ITAU UNIBANCO",5),("BANCO ITAU",4),("ITAÚ UNIBANCO",5),("ITOKEN",4),("0300 789 8484",4)]),
+        ("Bradesco (237)",              [("BANCO BRADESCO",5),("BRADESCO S.A",5),("BRADESCO PRIME",4),("BRADESCO",3),("0800 704 8383",4)]),
+        ("Banco do Brasil (001)",       [("BANCO DO BRASIL",5),("BB.COM.BR",5),("0800 729 0722",4),("AGENCIA BB",3),("AGÊNCIA BB",3)]),
         ("Caixa Econômica Federal (104)",[("CAIXA ECONOMICA FEDERAL",5),("CAIXA ECONÔMICA FEDERAL",5),("CEF",2),("0800 726 0101",4),("CAIXA.GOV",4)]),
-        ("Sicoob (756)",               [("SICOOB",5),("0800 642 2200",4)]),
-        ("Sicredi (748)",              [("SICREDI",5),("0800 724 7220",4)]),
-        ("Banco Inter (077)",          [("BANCO INTER",5),("INTER S.A",4),("CONTA DIGITAL INTER",5)]),
-        ("Nubank (260)",               [("NUBANK",5),("NU PAGAMENTOS",5),("NUCONTA",4)]),
-        ("C6 Bank (336)",              [("C6 BANK",5),("C6 S.A",4)]),
-        ("Banrisul (041)",             [("BANRISUL",5),("BANCO DO ESTADO DO RIO GRANDE",4)]),
-        ("Stone Pagamentos (197)",     [("STONE PAGAMENTOS",5),("STONECO",4)]),
-        ("Unicred (136)",              [("UNICRED",5)]),
-        ("Mercado Pago (323)",         [("MERCADO PAGO",5),("MERCADOPAGO",5)]),
+        ("Sicoob (756)",                [("SICOOB",5),("0800 642 2200",4)]),
+        ("Sicredi (748)",               [("SICREDI",5),("0800 724 7220",4)]),
+        ("Banco Inter (077)",           [("BANCO INTER",5),("INTER S.A",4),("CONTA DIGITAL INTER",5)]),
+        ("Nubank (260)",                [("NUBANK",5),("NU PAGAMENTOS",5),("NUCONTA",4)]),
+        ("C6 Bank (336)",               [("C6 BANK",5),("C6 S.A",4)]),
+        ("Banrisul (041)",              [("BANRISUL",5),("BANCO DO ESTADO DO RIO GRANDE",4)]),
+        ("Stone Pagamentos (197)",      [("STONE PAGAMENTOS",5),("STONECO",4)]),
+        ("Unicred (136)",               [("UNICRED",5)]),
+        ("Mercado Pago (323)",          [("MERCADO PAGO",5),("MERCADOPAGO",5)]),
     ]
     scores = {}
     for bank_key, signatures in BANK_SIGNATURES:
@@ -576,24 +564,37 @@ if uploaded_file is not None:
         detected_bank = None
 
 col1, col2 = st.columns([2, 1])
+
 with col1:
     bank_options  = list(BANK_MAPPING.keys())
-    default_index = (bank_options.index(detected_bank) if detected_bank and detected_bank in bank_options else 0)
+    default_index = (
+        bank_options.index(detected_bank)
+        if detected_bank and detected_bank in bank_options
+        else 0
+    )
     if uploaded_file is not None:
         if detected_bank:
             st.success(f"✅ Banco detectado automaticamente: **{detected_bank}**")
         else:
             st.warning("⚠️ Banco não identificado. Selecione manualmente abaixo.")
-    bank_selected = st.selectbox("Leiaute do Banco (confirme ou corrija se necessário):", options=bank_options, index=default_index)
+    bank_selected = st.selectbox(
+        "Leiaute do Banco (confirme ou corrija se necessário):",
+        options=bank_options,
+        index=default_index,
+    )
 
 with col2:
-    manual_initial_balance = st.number_input("Saldo Inicial da Conta (R$):", value=0.0, step=100.0, format="%.2f", help="Informe o saldo anterior caso o PDF não o contenha.")
+    manual_initial_balance = st.number_input(
+        "Saldo Inicial da Conta (R$):",
+        value=0.0, step=100.0, format="%.2f",
+        help="Informe o saldo anterior caso o PDF não o contenha."
+    )
 
 if uploaded_file is not None:
     if st.button("Converter para OFX e Exibir Extrato", type="primary"):
         parser_func, bank_code = BANK_MAPPING[bank_selected]
         try:
-            pdf_bytes = uploaded_file.read()
+            pdf_bytes  = uploaded_file.read()
             text_lines = []
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                 for page in pdf.pages:
@@ -607,11 +608,15 @@ if uploaded_file is not None:
                 transactions = parser_func(text_lines)
 
             if not transactions:
-                st.error(f"Nenhum lançamento identificado com o leiaute '{bank_selected}'. Verifique se o PDF contém texto selecionável.")
+                st.error(
+                    f"Nenhum lançamento identificado com o leiaute '{bank_selected}'. "
+                    f"Verifique se o PDF contém texto selecionável."
+                )
             else:
                 transactions.sort(key=lambda x: x["date_obj"])
+
                 pdf_initial     = BankParsers._extract_initial_balance(text_lines)
-                initial_balance = (manual_initial_balance if manual_initial_balance != 0.0 else pdf_initial)
+                initial_balance = manual_initial_balance if manual_initial_balance != 0.0 else pdf_initial
                 total_credits   = sum(t["amount"] for t in transactions if t["amount"] > 0)
                 total_debits    = sum(t["amount"] for t in transactions if t["amount"] < 0)
                 final_balance   = initial_balance + total_credits + total_debits
@@ -626,10 +631,34 @@ if uploaded_file is not None:
 
                 ofx_data        = generate_ofx(transactions, bank_code)
                 output_filename = os.path.splitext(uploaded_file.name)[0] + ".ofx"
-                st.download_button(label="📥 Baixar Arquivo OFX Gerado", data=ofx_data, file_name=output_filename, mime="application/x-ofx", type="secondary")
+
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    st.download_button(
+                        label="📥 Baixar Arquivo OFX",
+                        data=ofx_data,
+                        file_name=output_filename,
+                        mime="application/x-ofx",
+                        type="secondary"
+                    )
+                with col_dl2:
+                    csv_data = pd.DataFrame([{
+                        "Data":       t["date_obj"].strftime("%d/%m/%Y"),
+                        "Descrição":  t["description"],
+                        "Tipo":       "Entrada" if t["amount"] > 0 else "Saída",
+                        "Valor (R$)": t["amount"],
+                    } for t in transactions]).to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="📥 Baixar CSV",
+                        data=csv_data,
+                        file_name=output_filename.replace(".ofx", ".csv"),
+                        mime="text/csv",
+                        type="secondary"
+                    )
 
                 st.markdown("---")
-                st.subheader("📋 Lançamentos Extrato (Ordem Cronológica)")
+                st.subheader(f"📋 Lançamentos Extrato — {len(transactions)} registros encontrados")
+
                 df = pd.DataFrame([{
                     "Data":       t["date_obj"].strftime("%d/%m/%Y"),
                     "Descrição":  t["description"],
@@ -640,10 +669,17 @@ if uploaded_file is not None:
                 def color_amount(val):
                     return f"color: {'#28a745' if val > 0 else '#dc3545'}; font-weight: bold;"
 
+                # Altura dinâmica: mostra todos sem precisar de scroll
+                row_height   = 35
+                header_extra = 38
+                table_height = min(len(df) * row_height + header_extra, 800)
+
                 st.dataframe(
-                    df.style.map(color_amount, subset=["Valor (R$)"]).format({"Valor (R$)": fmt_brl}),
+                    df.style
+                      .map(color_amount, subset=["Valor (R$)"])
+                      .format({"Valor (R$)": fmt_brl}),
                     use_container_width=True,
-                    height=400
+                    height=table_height
                 )
 
         except Exception as e:
