@@ -52,6 +52,7 @@ class BankParsers:
 
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
+
         SKIP_TERMS = [
             "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
             "SALDO DISPONIVEL", "SALDO DISPONÍVEL",
@@ -70,11 +71,11 @@ class BankParsers:
             "V&T", "DATA/HORA",
         ]
 
-        # Termos que indicam linha de zeramento (RESGATE CONTAMAX, APLICACAO CONTAMAX)
-        # Essas linhas têm o valor na coluna SALDO, não VALOR — devem ser ignoradas
-        IGNORE_HIST_TERMS = [
+        # Linhas de zeramento automático — ignorar completamente
+        IGNORE_HIST = [
             "RESGATE CONTAMAX",
             "APLICACAO CONTAMAX",
+            "APLICAÇÃO CONTAMAX",
         ]
 
         RE_FLAG      = re.compile(r"^[abp]\.?$", re.IGNORECASE)
@@ -82,36 +83,40 @@ class BankParsers:
         RE_VALUE     = re.compile(r"^-?[\d\.]+,\d{2}$")
         RE_DOC       = re.compile(r"^\d{5,7}$")
 
+        def is_skip(text):
+            u = text.upper()
+            return any(s in u for s in SKIP_TERMS)
+
+        def is_ignore(text):
+            u = text.upper()
+            return any(s in u for s in IGNORE_HIST)
+
         def is_invalid_desc(s):
             return (
                 not s
-                or re.fullmatch(r"[\d\s/\.]+", s)
+                or re.fullmatch(r"[\d\s/\.,-]+", s)
                 or RE_FLAG.match(s.strip())
             )
-
-        def is_ignore_line(hist):
-            hu = hist.upper()
-            return any(t in hu for t in IGNORE_HIST_TERMS)
 
         transactions = []
 
         if pdf_bytes:
             try:
-                # ── Limites de coluna calibrados pelo PDF real ──
-                # Inspecionando o PDF do Santander:
-                #   Data      ~  55 – 130
-                #   Histórico ~ 130 – 400
-                #   Documento ~ 400 – 475
-                #   Valor     ~ 475 – 575   (coluna "Valor" — vermelho/preto)
-                #   Saldo     ~ 575 +        (coluna "Saldo" — ignorada)
+                # ── Limites de coluna do Santander (em pontos PDF) ──
+                # Inspecionado no PDF real:
+                #   Data       ~  50 – 135
+                #   Histórico  ~ 135 – 415
+                #   Documento  ~ 415 – 490
+                #   Valor      ~ 490 – 590   ← coluna "Valor" (vermelho/preto)
+                #   Saldo      ~ 590+         ← ignorado
                 X_DATE_MIN =  50
-                X_DATE_MAX = 130
-                X_HIST_MIN = 130
-                X_HIST_MAX = 400
-                X_DOC_MIN  = 400
-                X_DOC_MAX  = 475
-                X_VAL_MIN  = 475
-                X_VAL_MAX  = 575
+                X_DATE_MAX = 135
+                X_HIST_MIN = 135
+                X_HIST_MAX = 415
+                X_DOC_MIN  = 415
+                X_DOC_MAX  = 490
+                X_VAL_MIN  = 490
+                X_VAL_MAX  = 590
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
@@ -124,43 +129,68 @@ class BankParsers:
                         if not words:
                             continue
 
-                        # Agrupa palavras por linha (Y com tolerância de 3pt)
-                        lines_by_y = defaultdict(list)
+                        # ── Passo 1: agrupa palavras por Y com tolerância fina ──
+                        raw_lines = defaultdict(list)
                         for w in words:
                             y_key = round(w["top"] / 3) * 3
-                            lines_by_y[y_key].append(w)
+                            raw_lines[y_key].append(w)
 
-                        # Estado do lançamento em aberto
+                        # ── Passo 2: mescla sub-linhas próximas (até 18pt) ──
+                        # O Santander quebra o histórico em sub-linhas dentro
+                        # da mesma célula. Cada célula tem ~30-35pt de altura,
+                        # sub-linhas ficam a ~12-15pt de distância.
+                        # Mesclamos sub-linhas consecutivas que NÃO têm data
+                        # nem valor — elas pertencem ao lançamento anterior.
+                        sorted_ys  = sorted(raw_lines.keys())
+                        groups     = []   # lista de (y_ref, [words])
+
+                        for y in sorted_ys:
+                            row_words = sorted(raw_lines[y], key=lambda w: w["x0"])
+
+                            # Verifica se esta sub-linha tem data ou valor
+                            has_date = any(
+                                X_DATE_MIN <= w["x0"] < X_DATE_MAX
+                                and RE_DATE_FULL.match(w["text"])
+                                for w in row_words
+                            )
+                            has_val = any(
+                                X_VAL_MIN <= w["x0"] < X_VAL_MAX
+                                and RE_VALUE.match(w["text"])
+                                for w in row_words
+                            )
+
+                            if not groups:
+                                groups.append((y, list(row_words)))
+                                continue
+
+                            last_y, last_words = groups[-1]
+                            gap = y - last_y
+
+                            # Se a sub-linha está próxima (≤18pt) e não tem
+                            # data nem valor próprios → é continuação de histórico
+                            if gap <= 18 and not has_date and not has_val:
+                                # Adiciona apenas as palavras de histórico
+                                hist_words = [
+                                    w for w in row_words
+                                    if X_HIST_MIN <= w["x0"] < X_HIST_MAX
+                                ]
+                                last_words.extend(hist_words)
+                                groups[-1] = (last_y, last_words)
+                            else:
+                                groups.append((y, list(row_words)))
+
+                        # ── Passo 3: processa cada grupo como uma linha lógica ──
                         p_date = None
                         p_desc = []
-                        p_val  = None          # valor já encontrado mas pending ainda aberto
-                        last_saved = [None]    # referência mutável ao último dict salvo
 
-                        def _commit(dt_obj, desc, val_str):
-                            """Converte e salva um lançamento."""
-                            try:
-                                val = float(
-                                    val_str.replace(".", "").replace(",", ".")
-                                )
-                            except ValueError:
-                                return
-                            entry = {
-                                "date_obj":    dt_obj,
-                                "amount":      val,
-                                "description": desc,
-                            }
-                            transactions.append(entry)
-                            last_saved[0] = entry
-
-                        def save_pending(val_str=None):
-                            nonlocal p_date, p_desc, p_val
-                            vs = val_str or p_val
-                            if not p_date or not p_desc or not vs:
-                                p_date = None; p_desc = []; p_val = None
+                        def save_pending(val_str):
+                            nonlocal p_date, p_desc
+                            if not p_date or not p_desc or not val_str:
+                                p_date = None; p_desc = []
                                 return
                             dt_obj = BankParsers._parse_date(p_date)
                             if not dt_obj:
-                                p_date = None; p_desc = []; p_val = None
+                                p_date = None; p_desc = []
                                 return
                             clean = [
                                 pt for pt in p_desc
@@ -169,22 +199,30 @@ class BankParsers:
                             ]
                             desc = " ".join(clean).strip()
                             if is_invalid_desc(desc):
-                                p_date = None; p_desc = []; p_val = None
+                                p_date = None; p_desc = []
                                 return
-                            _commit(dt_obj, desc, vs)
-                            p_date = None; p_desc = []; p_val = None
+                            try:
+                                val = float(
+                                    val_str.replace(".", "").replace(",", ".")
+                                )
+                                transactions.append({
+                                    "date_obj":    dt_obj,
+                                    "amount":      val,
+                                    "description": desc,
+                                })
+                            except ValueError:
+                                pass
+                            p_date = None; p_desc = []
 
                         def discard_pending():
-                            nonlocal p_date, p_desc, p_val
-                            p_date = None; p_desc = []; p_val = None
+                            nonlocal p_date, p_desc
+                            p_date = None; p_desc = []
 
-                        # ── Processa cada linha Y ──
-                        for y in sorted(lines_by_y.keys()):
-                            row = sorted(lines_by_y[y], key=lambda w: w["x0"])
+                        for _y, row_words in groups:
+                            row = sorted(row_words, key=lambda w: w["x0"])
 
                             date_tokens = []
                             hist_tokens = []
-                            doc_tokens  = []
                             val_tokens  = []
 
                             for w in row:
@@ -192,9 +230,10 @@ class BankParsers:
                                 if X_DATE_MIN <= x0 < X_DATE_MAX:
                                     date_tokens.append(text)
                                 elif X_HIST_MIN <= x0 < X_HIST_MAX:
-                                    hist_tokens.append(text)
+                                    if not RE_FLAG.match(text) and not RE_DOC.match(text):
+                                        hist_tokens.append(text)
                                 elif X_DOC_MIN <= x0 < X_DOC_MAX:
-                                    doc_tokens.append(text)
+                                    pass  # documento: ignorado
                                 elif X_VAL_MIN <= x0 < X_VAL_MAX:
                                     val_tokens.append(text)
                                 # x0 >= X_VAL_MAX → coluna Saldo → ignora
@@ -206,43 +245,46 @@ class BankParsers:
                             is_date  = bool(RE_DATE_FULL.match(date_str))
                             is_value = bool(val_str and RE_VALUE.match(val_str))
 
-                            # Remove flags (a/b/p) do histórico
+                            # Filtra cabeçalhos/rodapés
+                            combined = (date_str + " " + hist_str).upper()
+                            if is_skip(combined):
+                                discard_pending()
+                                continue
+
+                            # Ignora linhas de zeramento CONTAMAX
+                            if hist_str and is_ignore(hist_str):
+                                discard_pending()
+                                continue
+
+                            # Remove flag solta (a/b/p)
                             if hist_str and RE_FLAG.match(hist_str.strip()):
                                 hist_str = ""
-
-                            # Remove número de documento que vazou para hist
-                            hist_str = " ".join(
-                                t for t in hist_str.split()
-                                if not RE_DOC.match(t)
-                            ).strip()
-
-                            # Filtra cabeçalhos e rodapés
-                            combined = (date_str + " " + hist_str).upper()
-                            if any(skip in combined for skip in SKIP_TERMS):
-                                discard_pending()
-                                continue
-
-                            # Linhas de zeramento (RESGATE/APLICACAO CONTAMAX):
-                            # o valor delas fica na coluna Saldo → ignorar
-                            if hist_str and is_ignore_line(hist_str):
-                                discard_pending()
-                                continue
 
                             # ── Máquina de estados ──
 
                             if is_date and hist_str and is_value:
-                                # Linha completa em uma única Y
+                                # Linha completa
                                 discard_pending()
                                 dt_obj = BankParsers._parse_date(date_str)
                                 if dt_obj and not is_invalid_desc(hist_str):
-                                    _commit(dt_obj, hist_str, val_str)
+                                    try:
+                                        val = float(
+                                            val_str.replace(".", "").replace(",", ".")
+                                        )
+                                        transactions.append({
+                                            "date_obj":    dt_obj,
+                                            "amount":      val,
+                                            "description": hist_str,
+                                        })
+                                    except ValueError:
+                                        pass
 
                             elif is_date and hist_str and not is_value:
-                                # Início de lançamento multi-linha
+                                # Início de lançamento: tem data+hist mas valor
+                                # ainda não apareceu
                                 discard_pending()
                                 p_date = date_str
                                 p_desc = [hist_str]
-                                p_val  = None
 
                             elif is_date and not hist_str and is_value:
                                 # Data + valor sem histórico → fecha pending
@@ -252,27 +294,19 @@ class BankParsers:
                                     discard_pending()
 
                             elif is_date and not hist_str and not is_value:
-                                # Só data (linha de flag/doc sem texto útil)
+                                # Só data (linha de flag/doc)
                                 pass
 
                             elif not is_date and hist_str and is_value:
-                                # Continuação com valor → acumula hist e fecha
+                                # Continuação com valor → fecha
                                 if p_date:
                                     p_desc.append(hist_str)
                                     save_pending(val_str)
-                                else:
-                                    # Sem pending: complementa último salvo
-                                    if last_saved[0] is not None:
-                                        last_saved[0]["description"] += " " + hist_str
 
                             elif not is_date and hist_str and not is_value:
-                                # Linha de continuação de histórico puro
+                                # Continuação de histórico puro
                                 if p_date:
                                     p_desc.append(hist_str)
-                                elif last_saved[0] is not None:
-                                    # Continuação chegou APÓS o valor já ter
-                                    # sido salvo → complementa descrição
-                                    last_saved[0]["description"] += " " + hist_str
 
                             elif not is_date and not hist_str and is_value:
                                 # Só valor → fecha pending
@@ -287,7 +321,7 @@ class BankParsers:
             except Exception:
                 transactions = []
 
-        # ── Fallback: parsing por texto puro ──
+        # ── Fallback texto puro ──
         RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
 
         merged = []
@@ -295,21 +329,21 @@ class BankParsers:
             s = raw.strip()
             if not s:
                 continue
-            if any(skip in s.upper() for skip in SKIP_TERMS):
+            if is_skip(s):
+                continue
+            if is_ignore(s):
                 continue
             if RE_DATE_START.match(s):
                 merged.append(s)
             else:
                 if merged:
                     merged[-1] += " " + s
-                else:
-                    merged.append(s)
 
         PAT = re.compile(
             r"(\d{2}/\d{2}/\d{4})"
             r"(?:\s+[abp]\.?)?"
             r"\s+(.+?)"
-            r"\s+(\d{5,6})"
+            r"\s+(\d{5,7})"
             r"\s+(-?[\d\.]+,\d{2})"
             r"(?:\s+-?[\d\.]+,\d{2})?",
             re.IGNORECASE,
@@ -317,9 +351,7 @@ class BankParsers:
 
         for line in merged:
             s = line.strip()
-            if any(skip in s.upper() for skip in SKIP_TERMS):
-                continue
-            if any(t in s.upper() for t in IGNORE_HIST_TERMS):
+            if is_skip(s) or is_ignore(s):
                 continue
             m = PAT.search(s)
             if m:
@@ -710,8 +742,8 @@ uploaded_file = st.file_uploader(
     "Selecione o arquivo PDF do extrato", type=["pdf"]
 )
 
-detected_bank  = None
-preview_lines  = []
+detected_bank = None
+preview_lines = []
 
 if uploaded_file is not None:
     try:
