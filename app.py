@@ -163,170 +163,140 @@ class BankParsers:
 
                 cols_sorted = sorted(col_x.items(), key=lambda c: c[1])
 
-                def x_range(name):
-                    for i, (n, x0) in enumerate(cols_sorted):
-                        if n == name:
-                            end = (cols_sorted[i + 1][1]
-                                   if i + 1 < len(cols_sorted)
-                                   else page_w)
-                            return (x0 - 2, end - 1)
-                    return None
+                # Limites X de cada coluna
+                col_bounds = {}
+                for i, (name, x0) in enumerate(cols_sorted):
+                    x1 = (cols_sorted[i + 1][1]
+                           if i + 1 < len(cols_sorted)
+                           else page_w)
+                    col_bounds[name] = (x0 - 2, x1 - 1)
 
-                XD = x_range("DATA")
-                XH = x_range("HISTORICO")
-                XV = x_range("VALOR")
+                XD = col_bounds.get("DATA")
+                XH = col_bounds.get("HISTORICO")
+                XV = col_bounds.get("VALOR")
 
                 if not XD or not XH or not XV:
                     return transactions
 
                 # ══════════════════════════════════════════════════
-                # PASSO 2 — Agrupar palavras por linha (Y próximo)
-                # e reconstruir blocos de transação
+                # PASSO 2 — Para cada página, extrai palavras por
+                # coluna e monta blocos de transação
                 # ══════════════════════════════════════════════════
                 for page in pdf.pages:
 
-                    words = page.extract_words(
+                    def words_in_col(x_bounds, y0=0, y1=None):
+                        """Retorna palavras dentro de um intervalo X,
+                        ordenadas por top."""
+                        if y1 is None:
+                            y1 = page.height
+                        try:
+                            crop = page.within_bbox(
+                                (x_bounds[0], y0, x_bounds[1], y1))
+                            return crop.extract_words(
+                                x_tolerance=3, y_tolerance=3,
+                                keep_blank_chars=False,
+                                use_text_flow=False,
+                            )
+                        except Exception:
+                            return []
+
+                    # Detecta y_header (linha do cabeçalho DATA/VALOR)
+                    all_words = page.extract_words(
                         x_tolerance=3, y_tolerance=3,
                         keep_blank_chars=False, use_text_flow=False,
                     )
+                    by_y = defaultdict(list)
+                    for w in all_words:
+                        by_y[round(w["top"])].append(w)
 
-                    if not words:
-                        continue
-
-                    # Agrupa palavras em linhas por proximidade de Y (±4pt)
-                    Y_TOL = 4
-                    rows  = []   # lista de (y_center, [words])
-                    for w in sorted(words, key=lambda x: x["top"]):
-                        placed = False
-                        for row in rows:
-                            if abs(w["top"] - row[0]) <= Y_TOL:
-                                row[1].append(w)
-                                row[0] = (row[0] + w["top"]) / 2
-                                placed = True
-                                break
-                        if not placed:
-                            rows.append([w["top"], [w]])
-
-                    # Detecta y_header e y_footer
                     y_header = None
                     y_footer = page.height
 
-                    for y_c, row_words in rows:
-                        row_norms = [norm(rw["text"]) for rw in row_words]
+                    for y_key in sorted(by_y):
+                        row_norms = [norm(w["text"]) for w in by_y[y_key]]
                         joined    = " ".join(row_norms)
-
                         if "DATA" in row_norms and "VALOR" in row_norms:
-                            y_header = y_c
+                            y_header = by_y[y_key][0]["bottom"]
                             continue
-
                         if y_header and any(
                             norm(s) in joined for s in [
                                 "SALDO DE CONTA", "SALDO BLOQUEADO",
-                                "SALDO DISPONIVEL", "A - SALDO",
-                                "B - SALDO", "C - SALDO",
+                                "SALDO DISPONIVEL",
+                                "A - SALDO", "B - SALDO", "C - SALDO",
                                 "BLOQUEIO DIA",
                                 "LANCAMENTO PROVISIONADO",
                                 "CENTRAL DE ATENDIMENTO",
                             ]
                         ):
-                            y_footer = y_c
+                            y_footer = by_y[y_key][0]["top"]
                             break
 
                     if y_header is None:
                         continue
 
-                    # Filtra apenas linhas da área útil
-                    data_rows = [
-                        (y_c, rw)
-                        for y_c, rw in rows
-                        if y_c > y_header and y_c < y_footer
-                    ]
+                    # Extrai palavras de cada coluna na área útil
+                    date_words = words_in_col(XD, y_header, y_footer)
+                    hist_words = words_in_col(XH, y_header, y_footer)
+                    val_words  = words_in_col(XV, y_header, y_footer)
 
-                    # ── Classifica cada palavra na sua coluna ──────
-                    def col_of(word):
-                        x = word["x0"]
-                        # Encontra a coluna mais próxima à esquerda
-                        best = None
-                        for name, cx in cols_sorted:
-                            if x >= cx - 5:
-                                best = name
-                            else:
-                                break
-                        return best
+                    # ── Agrupa palavras de DATA em eventos ────────
+                    # Cada evento = uma linha com data válida
+                    # Identifica os Y de cada data encontrada
+                    date_events = []   # [(y_top, y_bot, date_str)]
+                    for w in date_words:
+                        txt = w["text"].strip()
+                        if RE_DATE.match(txt):
+                            date_events.append({
+                                "date":  txt,
+                                "y_top": w["top"],
+                                "y_bot": w["bottom"],
+                            })
 
-                    # ── Monta blocos de transação ──────────────────
-                    # Cada bloco começa numa linha que tem DATA
-                    # e pode continuar em linhas sem DATA (continuação
-                    # do histórico multilinha).
-                    blocks = []   # lista de dicts
-                    current = None
+                    if not date_events:
+                        continue
 
-                    for y_c, row_words in data_rows:
-                        # Separa palavras por coluna
-                        by_col = defaultdict(list)
-                        for w in row_words:
-                            c = col_of(w)
-                            if c:
-                                by_col[c].append(w["text"])
-
-                        date_tokens = by_col.get("DATA", [])
-                        hist_tokens = by_col.get("HISTORICO", [])
-                        val_tokens  = by_col.get("VALOR", [])
-
-                        # Remove flag (a/b/p) da data
-                        date_clean_tokens = [
-                            t for t in date_tokens
-                            if not RE_FLAG.fullmatch(t)
-                        ]
-                        date_str = " ".join(date_clean_tokens).strip()
-
-                        # Verifica se é início de novo lançamento
-                        is_new = RE_DATE.match(date_str)
-
-                        if is_new:
-                            if current:
-                                blocks.append(current)
-                            current = {
-                                "date":  date_str,
-                                "hist":  list(hist_tokens),
-                                "value": list(val_tokens),
-                            }
+                    # Define intervalo Y de cada evento:
+                    # do y_top da data até o y_top da próxima data
+                    for i, ev in enumerate(date_events):
+                        if i + 1 < len(date_events):
+                            ev["y_end"] = date_events[i + 1]["y_top"]
                         else:
-                            # Continuação: acumula histórico
-                            if current is not None:
-                                current["hist"].extend(hist_tokens)
-                                if not current["value"]:
-                                    current["value"].extend(val_tokens)
+                            ev["y_end"] = y_footer
 
-                    if current:
-                        blocks.append(current)
+                    # ── Para cada evento, coleta histórico e valor ─
+                    for ev in date_events:
+                        y0 = ev["y_top"] - 2   # margem superior
+                        y1 = ev["y_end"]
 
-                    # ── Processa cada bloco ────────────────────────
-                    for blk in blocks:
-                        date_str = blk["date"]
-                        hist_str = clean_hist(" ".join(blk["hist"]))
-                        val_raw  = " ".join(blk["value"])
+                        # Histórico: todas as palavras de HISTORICO
+                        # no intervalo Y do evento
+                        hist_parts = [
+                            w["text"] for w in hist_words
+                            if w["top"] >= y0 and w["top"] < y1
+                        ]
 
-                        # Filtra tokens inválidos do histórico
-                        hist_tokens = hist_str.split()
-                        hist_clean  = [
-                            t for t in hist_tokens
+                        # Valor: primeiro token numérico válido
+                        # no intervalo Y do evento
+                        val_str = ""
+                        for w in val_words:
+                            if w["top"] >= y0 and w["top"] < y1:
+                                if RE_VALUE.match(w["text"]):
+                                    val_str = w["text"]
+                                    break
+
+                        # Monta e limpa histórico
+                        hist_str = clean_hist(" ".join(hist_parts))
+
+                        # Remove tokens indesejados do histórico
+                        hist_clean = [
+                            t for t in hist_str.split()
                             if not RE_DOC.match(t)
                             and not RE_VALUE.match(t)
                             and not RE_FLAG.fullmatch(t)
                         ]
                         hist_str = " ".join(hist_clean).strip()
 
-                        # Primeiro valor numérico válido
-                        val_str = ""
-                        for tok in val_raw.split():
-                            if RE_VALUE.match(tok):
-                                val_str = tok
-                                break
-
                         # Validações
-                        if not RE_DATE.match(date_str):
-                            continue
                         if not val_str:
                             continue
                         if not hist_str:
@@ -338,7 +308,7 @@ class BankParsers:
                         if is_invalid_desc(hist_str):
                             continue
 
-                        dt_obj = BankParsers._parse_date(date_str)
+                        dt_obj = BankParsers._parse_date(ev["date"])
                         if not dt_obj:
                             continue
 
