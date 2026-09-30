@@ -43,7 +43,8 @@ class BankParsers:
             match = pattern_saldo.search(line.strip())
             if match:
                 try:
-                    return float(match.group(1).replace(".", "").replace(",", "."))
+                    return float(
+                        match.group(1).replace(".", "").replace(",", "."))
                 except ValueError:
                     continue
         return 0.0
@@ -74,6 +75,14 @@ class BankParsers:
             "C - SALDO", "D - SALDO", "E - SALDO", "F - SALDO",
             "A = SALDO", "B = SALDO", "BLOQUEIO DIA",
             "LANCAMENTO PROVISIONADO",
+            # Rodapé da página
+            "CENTRAL DE ATENDIMENTO", "SAC", "OUVIDORIA",
+            "4004 2125", "0800 702", "0800 726", "0800 762",
+            "DAS 8H", "SEGUNDA A SEXTA", "ATENDIMENTO",
+            "CANAL EXCLUSIVO", "LIBRAS", "EXTERIOR",
+            "A - SALDO DE CONTA", "B - SALDO BLOQUEADO",
+            "C - SALDO DISPONIVEL", "D - SALDO EM INVEST",
+            "E - SALDO DISPONIVEL", "F - SALDO DISPONIVEL",
         ]
 
         RE_DATE  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
@@ -108,21 +117,64 @@ class BankParsers:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
-                # ══════════════════════════════════════════════════════
-                # PASSO 1 — Detectar coordenadas X reais do cabeçalho
-                # Lê todas as palavras da página e encontra a linha
-                # que contém "Data" e "Valor" simultaneamente
-                # ══════════════════════════════════════════════════════
-                col_x   = {}
-                page_w  = pdf.pages[0].width   # largura real da página
+                # ══════════════════════════════════════════════════
+                # PASSO 1 — Detectar Y do cabeçalho e Y do rodapé
+                # em cada página, para limitar a área de extração
+                # ══════════════════════════════════════════════════
+                def find_header_footer_y(page):
+                    """
+                    Retorna (y_header, y_footer):
+                    - y_header: Y abaixo da linha de cabeçalho
+                      "Data Histórico Documento Valor Saldo"
+                    - y_footer: Y acima do rodapé (legenda a/b/p ou
+                      saldos finais)
+                    """
+                    words = page.extract_words(
+                        x_tolerance=3, y_tolerance=3,
+                        keep_blank_chars=False, use_text_flow=False,
+                    )
+                    by_y = defaultdict(list)
+                    for w in words:
+                        by_y[round(w["top"])].append(w)
+
+                    y_header = None
+                    y_footer = page.height  # padrão: página inteira
+
+                    for y_key in sorted(by_y):
+                        row_norms = [norm(w["text"]) for w in by_y[y_key]]
+                        # Linha de cabeçalho da tabela
+                        if "DATA" in row_norms and "VALOR" in row_norms:
+                            y_header = y_key + 4
+                        # Início do rodapé: legenda a/b/p ou saldos
+                        if y_header and (
+                            any("SALDO DE CONTA" in n for n in row_norms)
+                            or any("BLOQUEIO DIA" in n for n in row_norms)
+                            or any("LANCAMENTO PROVISIONADO" in n
+                                   for n in row_norms)
+                            or any("CENTRAL DE ATENDIMENTO" in n
+                                   for n in row_norms)
+                            or (len(row_norms) >= 2
+                                and row_norms[0] in ("A", "B", "C", "D",
+                                                     "E", "F")
+                                and "SALDO" in " ".join(row_norms))
+                        ):
+                            y_footer = y_key - 4
+                            break
+
+                    return y_header, y_footer
+
+                # ══════════════════════════════════════════════════
+                # PASSO 2 — Detectar coordenadas X das colunas
+                # lendo a linha de cabeçalho da tabela
+                # ══════════════════════════════════════════════════
+                col_x  = {}
+                page_w = pdf.pages[0].width
 
                 for page in pdf.pages:
                     words = page.extract_words(
                         x_tolerance=3, y_tolerance=3,
-                        keep_blank_chars=False,
-                        use_text_flow=False,
+                        keep_blank_chars=False, use_text_flow=False,
                     )
-                    # Agrupa por Y (1pt de tolerância)
                     by_y = defaultdict(list)
                     for w in words:
                         by_y[round(w["top"])].append(w)
@@ -141,12 +193,9 @@ class BankParsers:
                     if len(col_x) >= 4:
                         break
 
-                # Fallback: proporções reais do PDF Santander IB
-                # (página ~841pt altura × ~595pt largura em A4)
-                # Cabeçalho medido: Data≈55, Histórico≈196,
-                #                   Documento≈421, Valor≈519, Saldo≈638
+                # Fallback com coordenadas reais medidas do PDF
                 if len(col_x) < 4:
-                    ratio = page_w / 595.0   # escala relativa ao A4
+                    ratio = page_w / 595.0
                     col_x = {
                         "DATA":      55.0  * ratio,
                         "HISTORICO": 196.0 * ratio,
@@ -155,7 +204,6 @@ class BankParsers:
                         "SALDO":     638.0 * ratio,
                     }
 
-                # Monta intervalos de cada coluna
                 cols_sorted = sorted(col_x.items(), key=lambda c: c[1])
 
                 def col_range(name):
@@ -172,20 +220,38 @@ class BankParsers:
                 R_HIST = col_range("HISTORICO") or (186,  411)
                 R_DOC  = col_range("DOCUMENTO") or (411,  509)
                 R_VAL  = col_range("VALOR")     or (509,  628)
-                # Saldo: x0 >= R_VAL[1]
 
-                # ══════════════════════════════════════════════════════
-                # PASSO 2 — Processar cada página
-                # Estratégia: agrupa palavras por linha (Y),
-                # identifica blocos de lançamento pelo aparecimento
-                # de uma DATA válida na coluna DATE.
-                # Linhas sem DATA são continuação do bloco anterior.
-                # ══════════════════════════════════════════════════════
+                def classify(w):
+                    x0 = w["x0"]
+                    if R_DATE[0] <= x0 < R_DATE[1]:
+                        return "DATE"
+                    if R_HIST[0] <= x0 < R_HIST[1]:
+                        return "HIST"
+                    if R_DOC[0]  <= x0 < R_DOC[1]:
+                        return "DOC"
+                    if R_VAL[0]  <= x0 < R_VAL[1]:
+                        return "VAL"
+                    if x0 >= R_VAL[1]:
+                        return "SALDO"
+                    return "OTHER"
+
+                # ══════════════════════════════════════════════════
+                # PASSO 3 — Processar cada página
+                # Extrai apenas a área entre cabeçalho e rodapé
+                # ══════════════════════════════════════════════════
                 for page in pdf.pages:
-                    words = page.extract_words(
+                    y_header, y_footer = find_header_footer_y(page)
+
+                    if y_header is None:
+                        continue  # página sem tabela (ex: página 3)
+
+                    # Recorta a página na área útil da tabela
+                    crop = page.within_bbox(
+                        (0, y_header, page_w, y_footer))
+
+                    words = crop.extract_words(
                         x_tolerance=3, y_tolerance=3,
-                        keep_blank_chars=False,
-                        use_text_flow=False,
+                        keep_blank_chars=False, use_text_flow=False,
                     )
                     if not words:
                         continue
@@ -193,32 +259,18 @@ class BankParsers:
                     # Agrupa por Y arredondado a 2pt
                     by_y = defaultdict(list)
                     for w in words:
+                        # top é relativo ao crop, precisa somar y_header
                         by_y[round(w["top"] / 2) * 2].append(w)
 
                     sorted_ys = sorted(by_y.keys())
 
-                    def classify(w):
-                        x0 = w["x0"]
-                        if R_DATE[0] <= x0 < R_DATE[1]:
-                            return "DATE"
-                        if R_HIST[0] <= x0 < R_HIST[1]:
-                            return "HIST"
-                        if R_DOC[0]  <= x0 < R_DOC[1]:
-                            return "DOC"
-                        if R_VAL[0]  <= x0 < R_VAL[1]:
-                            return "VAL"
-                        if x0 >= R_VAL[1]:
-                            return "SALDO"
-                        return "OTHER"
-
                     # Agrupa linhas em blocos:
-                    # novo bloco = linha com DATE válida
-                    # continuação = linha sem DATE (histórico multilinha)
+                    # novo bloco = linha com DATE válida na col DATE
+                    # continuação = linha sem DATE
                     blocks = []
 
                     for y in sorted_ys:
                         row = by_y[y]
-
                         has_date = any(
                             classify(w) == "DATE"
                             and RE_DATE.match(w["text"])
@@ -230,8 +282,7 @@ class BankParsers:
                         else:
                             last_y = blocks[-1][-1]
                             gap    = y - last_y
-                            # Continuação apenas se gap razoável (< 60pt)
-                            if gap < 60:
+                            if gap < 50:
                                 blocks[-1].append(y)
                             else:
                                 blocks.append([y])
@@ -254,27 +305,24 @@ class BankParsers:
                             if col == "DATE":
                                 if RE_DATE.match(t):
                                     date_words.append(w)
-                                # flags (a/b/p) → descarta
 
                             elif col == "HIST":
-                                # Descarta tokens que são doc, valor ou flag
                                 if (not RE_DOC.match(t)
                                         and not RE_VALUE.match(t)
                                         and not RE_FLAG.fullmatch(t)):
                                     hist_words.append(w)
 
                             elif col == "DOC":
-                                pass  # número do documento → ignora
+                                pass
 
                             elif col == "VAL":
                                 if RE_VALUE.match(t):
                                     val_words.append(w)
-                            # SALDO → ignora
 
                         date_str = " ".join(
                             w["text"] for w in date_words).strip()
 
-                        # Reconstrói histórico linha a linha (ordem Y)
+                        # Reconstrói histórico linha a linha
                         hist_by_y = defaultdict(list)
                         for w in hist_words:
                             hist_by_y[round(w["top"] / 2) * 2].append(w)
@@ -286,12 +334,11 @@ class BankParsers:
                                 " ".join(w["text"] for w in lw))
                         hist_str = " ".join(hist_lines).strip()
 
-                        # Primeiro valor da coluna VAL = lançamento
-                        # Segundo valor (se existir) = saldo → ignora
+                        # Primeiro valor = lançamento; segundo = saldo
                         val_str = (val_words[0]["text"].strip()
                                    if val_words else "")
 
-                        # ── Validações ──
+                        # Validações
                         if not RE_DATE.match(date_str):
                             continue
                         if not val_str or not RE_VALUE.match(val_str):
@@ -766,7 +813,6 @@ if uploaded_file is not None:
                     height=table_height,
                 )
 
-                # ── Expander com debug dos lançamentos capturados ──
                 with st.expander("🔍 Debug — lançamentos capturados"):
                     for t in transactions:
                         st.text(
