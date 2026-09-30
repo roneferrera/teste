@@ -50,32 +50,22 @@ class BankParsers:
                     continue
         return 0.0
 
-    # ------------------------------------------------------------------
-    # SANTANDER — parser por coordenadas X (extract_words)
-    # Calibrado com medições do PDF real do Santander Empresarial
-    # ------------------------------------------------------------------
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
         """
-        Layout do extrato Santander Empresarial — 5 colunas:
+        Layout Santander Empresarial — 5 colunas:
             Data | Histórico | Documento | Valor | Saldo
 
-        Coordenadas X medidas no PDF real (página A4 ~595pt):
-            Data      :  55 – 118 pt
-            Flag(a)   : 118 – 160 pt  → filtrado por RE_FLAG
-            Histórico : 118 – 388 pt  (inclui área da flag, flag é filtrada)
-            Documento : 388 – 458 pt  → ignorado (fora das faixas)
-            Valor     : 458 – 538 pt
-            Saldo     : 538 – 999 pt  → ignorado (evita capturar 0,00)
+        Coordenadas X medidas no PDF real (A4 ~595pt):
+            Data      :  40 – 118 pt
+            Flag(a/b) : 118 – 165 pt  → capturada no hist, filtrada por RE_FLAG
+            Histórico : 118 – 388 pt
+            Documento : 388 – 460 pt  → ignorado
+            Valor     : 460 – 538 pt
+            Saldo     : 538+          → ignorado
 
-        Casos cobertos pelo PDF real:
-          1. Linha simples: data + histórico + valor (ex: SAQUE DINHEIRO ATM)
-          2. Histórico quebrado 2 linhas (ex: DEBITO AUT. TELEFONE CELULAR VI / VO CELULAR)
-          3. Histórico quebrado 3 linhas (ex: PAGAMENTO DE BOLETO OUTROS / BANCOS... / ORES)
-          4. Flag "a" entre data e histórico (ex: CR COB BLOQ COMP CONF RECEBIMENTO)
-          5. Saldo "0,00" na coluna Saldo — descartado pela faixa X_VAL_MAX
-          6. Documento "000000", "600013", "370992" — descartado pela faixa X_DOC
-          7. RESGATE CONTAMAX com valor real (não o saldo 0,00)
+        Correção crítica: descrição final também é validada contra RE_FLAG
+        para evitar que "a" (flag de bloqueio) seja salvo como descrição.
         """
 
         SKIP_TERMS = [
@@ -87,36 +77,41 @@ class BankParsers:
             "A = SALDO", "B = SALDO",
             "A - SALDO DE CONTA", "B - SALDO BLOQUEADO",
             "C - SALDO DISPONIVEL", "D - SALDO EM",
-            "E - SALDO DISPONIVEL", "F - SALDO DISPONIVEL",
             "BLOQUEIO DIA", "LANÇAMENTO PROVISIONADO",
             "INTERNET BANKING", "CONTA CORRENTE",
             "CENTRAL DE ATENDIMENTO", "SAC", "OUVIDORIA",
             "4004", "0800", "DATA", "HISTÓRICO", "HISTORICO",
             "DOCUMENTO", "VALOR", "SALDO", "TOTAL", "RESUMO",
             "PERIODO", "PERÍODO", "AGÊNCIA", "AGENCIA",
-            "V&T", "PERÍODO:", "DATA/HORA",
+            "V&T", "DATA/HORA",
         ]
 
+        # Flag de bloqueio: "a", "b", "p" isolados (com ou sem ponto)
+        RE_FLAG      = re.compile(r"^[abp]\.?$", re.IGNORECASE)
         RE_DATE_FULL = re.compile(r"^\d{2}/\d{2}/\d{4}$")
         RE_VALUE     = re.compile(r"^-?[\d\.]+,\d{2}$")
-        RE_FLAG      = re.compile(r"^[abp]$", re.IGNORECASE)
+
+        # Descrição inválida: só dígitos/espaços/barras OU é uma flag
+        def is_invalid_desc(s):
+            return (
+                not s
+                or re.fullmatch(r"[\d\s/\.]+", s)
+                or RE_FLAG.match(s.strip())
+            )
 
         transactions = []
 
         # ==============================================================
-        # MODO COORDENADAS — usa extract_words() com posição X real
+        # MODO COORDENADAS
         # ==============================================================
         if pdf_bytes:
             try:
-                # ── Limites de coluna medidos no PDF real ──────────────
-                X_DATE_MIN =  40   # margem esquerda
-                X_DATE_MAX = 118   # Data termina antes de 118pt
-                X_HIST_MIN = 118   # Histórico começa em 118pt
-                X_HIST_MAX = 388   # Histórico termina antes de 388pt
-                X_VAL_MIN  = 458   # Valor começa em 458pt
-                X_VAL_MAX  = 538   # Valor termina antes de 538pt
-                # Documento: 388-458 → ignorado (entre X_HIST_MAX e X_VAL_MIN)
-                # Saldo:     538+    → ignorado (acima de X_VAL_MAX)
+                X_DATE_MIN =  40
+                X_DATE_MAX = 118
+                X_HIST_MIN = 118
+                X_HIST_MAX = 388
+                X_VAL_MIN  = 460
+                X_VAL_MAX  = 538
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
@@ -129,15 +124,13 @@ class BankParsers:
                         if not words:
                             continue
 
-                        # Agrupa palavras por linha (Y arredondado a 3pt)
                         lines_by_y = defaultdict(list)
                         for w in words:
                             y_key = round(w["top"] / 3) * 3
                             lines_by_y[y_key].append(w)
 
-                        # Estado da máquina de lançamento pendente
-                        p_date = None   # "DD/MM/YYYY" do lançamento em curso
-                        p_desc = []     # fragmentos de histórico acumulados
+                        p_date = None
+                        p_desc = []
 
                         def save_pending(val_str):
                             nonlocal p_date, p_desc
@@ -150,8 +143,13 @@ class BankParsers:
                                 p_date = None
                                 p_desc = []
                                 return
-                            desc = " ".join(p_desc).strip()
-                            if not desc or re.fullmatch(r"[\d\s/]+", desc):
+                            # Filtra fragmentos de flag da lista de desc
+                            clean_parts = [
+                                part for part in p_desc
+                                if not RE_FLAG.match(part.strip())
+                            ]
+                            desc = " ".join(clean_parts).strip()
+                            if is_invalid_desc(desc):
                                 p_date = None
                                 p_desc = []
                                 return
@@ -191,7 +189,7 @@ class BankParsers:
                                         hist_tokens.append(text)
                                 elif X_VAL_MIN <= x0 < X_VAL_MAX:
                                     val_tokens.append(text)
-                                # Documento (388-458) e Saldo (538+) → ignorados
+                                # Documento (388-460) e Saldo (538+) → ignorados
 
                             date_str = " ".join(date_tokens).strip()
                             hist_str = " ".join(hist_tokens).strip()
@@ -200,18 +198,23 @@ class BankParsers:
                             is_date  = bool(RE_DATE_FULL.match(date_str))
                             is_value = bool(val_str and RE_VALUE.match(val_str))
 
-                            # Pula linhas de cabeçalho/rodapé/saldo
+                            # Pula cabeçalhos/rodapés/saldos
                             combined = (date_str + " " + hist_str).upper()
                             if any(skip in combined for skip in SKIP_TERMS):
                                 discard_pending()
                                 continue
 
+                            # Linha onde hist_str é só a flag → trata como
+                            # "data sem histórico" (não interrompe pendente)
+                            if hist_str and RE_FLAG.match(hist_str.strip()):
+                                hist_str = ""
+
                             # ── Máquina de estados ───────────────────────
                             if is_date and hist_str and is_value:
-                                # Caso 1: linha completa
+                                # Linha completa
                                 discard_pending()
                                 dt_obj = BankParsers._parse_date(date_str)
-                                if dt_obj and not re.fullmatch(r"[\d\s/]+", hist_str):
+                                if dt_obj and not is_invalid_desc(hist_str):
                                     try:
                                         val = float(
                                             val_str.replace(".", "")
@@ -226,32 +229,40 @@ class BankParsers:
                                         pass
 
                             elif is_date and hist_str and not is_value:
-                                # Caso 2: início de histórico quebrado
+                                # Início de histórico quebrado
                                 discard_pending()
                                 p_date = date_str
                                 p_desc = [hist_str]
 
-                            elif is_date and not hist_str:
-                                # Data sem histórico — não interrompe pendente
+                            elif is_date and not hist_str and is_value:
+                                # Data + valor sem histórico na mesma linha
+                                # (raro — fecha pendente)
+                                if p_date:
+                                    save_pending(val_str)
+                                else:
+                                    discard_pending()
+
+                            elif is_date and not hist_str and not is_value:
+                                # Data sem histórico e sem valor
+                                # Não interrompe pendente (ex: data repetida)
                                 pass
 
                             elif not is_date and hist_str and is_value:
-                                # Caso 3: continuação com valor na mesma linha
+                                # Continuação com valor
                                 if p_date:
                                     p_desc.append(hist_str)
                                     save_pending(val_str)
 
                             elif not is_date and hist_str and not is_value:
-                                # Caso 4: continuação sem valor ainda
+                                # Continuação sem valor ainda
                                 if p_date:
                                     p_desc.append(hist_str)
 
                             elif not is_date and not hist_str and is_value:
-                                # Caso 5: valor em linha separada sem histórico
+                                # Valor em linha separada sem histórico
                                 if p_date:
                                     save_pending(val_str)
 
-                        # Fim de página: descarta pendente sem valor
                         discard_pending()
 
                 if transactions:
@@ -261,9 +272,7 @@ class BankParsers:
                 transactions = []
 
         # ==============================================================
-        # FALLBACK: texto puro (extract_text)
-        # Captura documento explicitamente e descarta;
-        # ignora saldo (número extra no final da linha)
+        # FALLBACK: texto puro
         # ==============================================================
         RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
 
@@ -284,12 +293,12 @@ class BankParsers:
 
         # DATA [flag] HISTÓRICO DOCUMENTO(5-6 dígitos) VALOR [SALDO]
         PAT = re.compile(
-            r"(\d{2}/\d{2}/\d{4})"        # data
-            r"(?:\s+[abp])?"              # flag opcional
-            r"\s+(.+?)"                   # histórico (lazy)
-            r"\s+(\d{5,6})"              # documento → descartado
-            r"\s+(-?[\d\.]+,\d{2})"      # valor
-            r"(?:\s+-?[\d\.]+,\d{2})?",  # saldo opcional → ignorado
+            r"(\d{2}/\d{2}/\d{4})"
+            r"(?:\s+[abp]\.?)?"
+            r"\s+(.+?)"
+            r"\s+(\d{5,6})"
+            r"\s+(-?[\d\.]+,\d{2})"
+            r"(?:\s+-?[\d\.]+,\d{2})?",
             re.IGNORECASE,
         )
 
@@ -301,7 +310,7 @@ class BankParsers:
             if m:
                 dt_str, desc, _doc, val_str = m.group(1, 2, 3, 4)
                 desc = desc.strip()
-                if not desc or re.fullmatch(r"[\d\s/]+", desc):
+                if is_invalid_desc(desc):
                     continue
                 dt_obj = BankParsers._parse_date(dt_str)
                 if dt_obj:
@@ -488,7 +497,6 @@ BANK_MAPPING = {
     "Mercado Pago (323)":             (BankParsers.generic_fallback,"323"),
 }
 
-# Parsers que recebem pdf_bytes além de text_lines
 BYTES_AWARE_PARSERS = {"033"}
 
 # ==========================================
