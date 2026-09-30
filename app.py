@@ -89,8 +89,10 @@ class BankParsers:
                 X_DATE_MAX = 118
                 X_HIST_MIN = 118
                 X_HIST_MAX = 388
+                X_DOC_MIN  = 388
+                X_DOC_MAX  = 460
                 X_VAL_MIN  = 460
-                X_VAL_MAX  = 538
+                X_VAL_MAX  = 560
 
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
                     for page in pdf.pages:
@@ -103,13 +105,32 @@ class BankParsers:
                         if not words:
                             continue
 
+                        # ── Agrupa palavras por linha (Y com tolerância de 3pt) ──
                         lines_by_y = defaultdict(list)
                         for w in words:
                             y_key = round(w["top"] / 3) * 3
                             lines_by_y[y_key].append(w)
 
+                        # ── Estrutura de pending e referência ao último salvo ──
                         p_date = None
                         p_desc = []
+                        last_saved = [None]   # lista mutável para acesso no closure
+
+                        def _append_transaction(dt_obj, desc, val_str):
+                            """Converte val_str, monta dict e adiciona à lista."""
+                            try:
+                                val = float(
+                                    val_str.replace(".", "").replace(",", ".")
+                                )
+                            except ValueError:
+                                return
+                            entry = {
+                                "date_obj":    dt_obj,
+                                "amount":      val,
+                                "description": desc,
+                            }
+                            transactions.append(entry)
+                            last_saved[0] = entry
 
                         def save_pending(val_str):
                             nonlocal p_date, p_desc
@@ -131,17 +152,7 @@ class BankParsers:
                                 p_date = None
                                 p_desc = []
                                 return
-                            try:
-                                val = float(
-                                    val_str.replace(".", "").replace(",", ".")
-                                )
-                                transactions.append({
-                                    "date_obj":    dt_obj,
-                                    "amount":      val,
-                                    "description": desc,
-                                })
-                            except ValueError:
-                                pass
+                            _append_transaction(dt_obj, desc, val_str)
                             p_date = None
                             p_desc = []
 
@@ -150,11 +161,13 @@ class BankParsers:
                             p_date = None
                             p_desc = []
 
+                        # ── Processa cada linha ordenada por Y ──
                         for y in sorted(lines_by_y.keys()):
                             row = sorted(lines_by_y[y], key=lambda w: w["x0"])
 
                             date_tokens = []
                             hist_tokens = []
+                            doc_tokens  = []
                             val_tokens  = []
 
                             for w in row:
@@ -164,6 +177,8 @@ class BankParsers:
                                 elif X_HIST_MIN <= x0 < X_HIST_MAX:
                                     if not RE_FLAG.match(text):
                                         hist_tokens.append(text)
+                                elif X_DOC_MIN <= x0 < X_DOC_MAX:
+                                    doc_tokens.append(text)
                                 elif X_VAL_MIN <= x0 < X_VAL_MAX:
                                     val_tokens.append(text)
 
@@ -174,58 +189,73 @@ class BankParsers:
                             is_date  = bool(RE_DATE_FULL.match(date_str))
                             is_value = bool(val_str and RE_VALUE.match(val_str))
 
+                            # Filtra linhas de cabeçalho/rodapé
                             combined = (date_str + " " + hist_str).upper()
                             if any(skip in combined for skip in SKIP_TERMS):
                                 discard_pending()
                                 continue
 
+                            # Remove flag solta (a/b/p) do histórico
                             if hist_str and RE_FLAG.match(hist_str.strip()):
                                 hist_str = ""
 
+                            # ────────────────────────────────────────────────
+                            # CASOS DE PARSING
+                            # ────────────────────────────────────────────────
+
                             if is_date and hist_str and is_value:
+                                # Linha completa numa só Y → salva direto
                                 discard_pending()
                                 dt_obj = BankParsers._parse_date(date_str)
                                 if dt_obj and not is_invalid_desc(hist_str):
-                                    try:
-                                        val = float(
-                                            val_str.replace(".", "")
-                                                   .replace(",", ".")
-                                        )
-                                        transactions.append({
-                                            "date_obj":    dt_obj,
-                                            "amount":      val,
-                                            "description": hist_str,
-                                        })
-                                    except ValueError:
-                                        pass
+                                    _append_transaction(dt_obj, hist_str, val_str)
 
                             elif is_date and hist_str and not is_value:
+                                # Início de lançamento multi-linha
                                 discard_pending()
                                 p_date = date_str
                                 p_desc = [hist_str]
 
                             elif is_date and not hist_str and is_value:
+                                # Data + valor sem histórico → fecha pending
                                 if p_date:
                                     save_pending(val_str)
                                 else:
                                     discard_pending()
 
                             elif is_date and not hist_str and not is_value:
+                                # Só a data (linha de flag/doc sem histórico)
                                 pass
 
                             elif not is_date and hist_str and is_value:
+                                # Continuação com valor → acumula e fecha
                                 if p_date:
                                     p_desc.append(hist_str)
                                     save_pending(val_str)
+                                else:
+                                    # Sem pending: tenta complementar o último salvo
+                                    if last_saved[0] is not None:
+                                        last_saved[0]["description"] += " " + hist_str
 
                             elif not is_date and hist_str and not is_value:
+                                # ── CORREÇÃO PRINCIPAL ──
+                                # Linha de continuação de histórico puro
+                                # (sem data, sem valor)
                                 if p_date:
+                                    # Pending ainda aberto → acumula normalmente
                                     p_desc.append(hist_str)
+                                elif last_saved[0] is not None:
+                                    # Pending já foi fechado (valor chegou antes
+                                    # desta linha de continuação) → complementa
+                                    # a descrição do último lançamento salvo
+                                    last_saved[0]["description"] += " " + hist_str
 
                             elif not is_date and not hist_str and is_value:
+                                # Só valor → fecha pending
                                 if p_date:
                                     save_pending(val_str)
 
+                        # Fecha qualquer pending que sobrou na página
                         discard_pending()
 
                 if transactions:
@@ -234,6 +264,7 @@ class BankParsers:
             except Exception:
                 transactions = []
 
+        # ── Fallback: parsing por texto puro (sem pdfplumber coordenadas) ──
         RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
 
         merged = []
@@ -448,16 +479,8 @@ BYTES_AWARE_PARSERS = {"033"}
 # ==========================================
 
 def detect_bank(text_lines):
-    """
-    Detecta o banco automaticamente a partir das primeiras linhas do PDF.
-    Usa sistema de pontuação para evitar falsos positivos.
-    Retorna a chave do BANK_MAPPING ou None se não identificado.
-    """
-    # Analisa as primeiras 40 linhas (cabeçalho do extrato)
     header_text = " ".join(text_lines[:40]).upper()
 
-    # Cada banco tem uma lista de termos únicos com pesos diferentes.
-    # Termos mais específicos têm peso maior.
     BANK_SIGNATURES = [
         (
             "Santander (033)", [
@@ -669,10 +692,10 @@ preview_lines  = []
 if uploaded_file is not None:
     try:
         pdf_bytes_preview = uploaded_file.read()
-        uploaded_file.seek(0)  # Rebobina para uso posterior
+        uploaded_file.seek(0)
 
         with pdfplumber.open(io.BytesIO(pdf_bytes_preview)) as pdf:
-            for page in pdf.pages[:2]:  # Só as 2 primeiras páginas
+            for page in pdf.pages[:2]:
                 text = page.extract_text()
                 if text:
                     preview_lines.extend(text.split("\n"))
@@ -756,7 +779,7 @@ if uploaded_file is not None:
                 st.subheader("📊 Resumo Financeiro da Conta")
 
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Saldo Inicial",      fmt_brl(initial_balance))
+                m1.metric("Saldo Inicial",       fmt_brl(initial_balance))
                 m2.metric("Entradas (Créditos)", fmt_brl(total_credits))
                 m3.metric("Saídas (Débitos)",    fmt_brl(abs(total_debits)))
                 m4.metric("Saldo Final",          fmt_brl(final_balance))
