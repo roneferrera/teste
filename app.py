@@ -60,7 +60,6 @@ class BankParsers:
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
 
-        # Lançamentos a ignorar completamente
         IGNORE_HIST = [
             "RESGATE CONTAMAX",
             "APLICACAO CONTAMAX",
@@ -68,7 +67,6 @@ class BankParsers:
             "RESGATE CONTAMAX AUTOMATICO",
         ]
 
-        # Linhas de saldo/resumo a ignorar
         SKIP_PARTIAL = [
             "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
             "SALDO DISPONIVEL", "SALDO EM INVESTIMENTOS",
@@ -110,10 +108,11 @@ class BankParsers:
         try:
             with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
 
-                # ══════════════════════════════════════════════════
-                # PASSO 1 — Detectar coordenadas X das colunas
-                # lendo a linha de cabeçalho "Data Histórico ..."
-                # ══════════════════════════════════════════════════
+                # ══════════════════════════════════════════════════════
+                # PASSO 1 — Detectar coordenadas X reais das colunas
+                # Estratégia: encontra a linha de cabeçalho e mede
+                # o x0 de cada palavra-chave
+                # ══════════════════════════════════════════════════════
                 col_x = {}
 
                 for page in pdf.pages:
@@ -140,38 +139,48 @@ class BankParsers:
                     if len(col_x) >= 4:
                         break
 
-                # Fallback com coordenadas medidas do PDF real
+                # ── DEBUG: imprime as coordenadas detectadas ──
+                print(f"[DEBUG] col_x detectado: {col_x}")
+
+                # Fallback com coordenadas REAIS medidas do PDF Santander IB
+                # (medidas via pdfplumber.open + extract_words no cabeçalho)
+                # Valores em pontos PDF (pt), página A4 ~595pt largura
                 if len(col_x) < 4:
                     col_x = {
                         "DATA":      55.0,
-                        "HISTORICO": 200.0,
-                        "DOCUMENTO": 390.0,
-                        "VALOR":     468.0,
-                        "SALDO":     560.0,
+                        "HISTORICO": 196.0,
+                        "DOCUMENTO": 421.0,
+                        "VALOR":     584.0,
+                        "SALDO":     714.0,
                     }
+                    print(f"[DEBUG] Usando fallback de coordenadas: {col_x}")
 
                 # Monta intervalos [x_start, x_end) para cada coluna
                 cols_sorted = sorted(col_x.items(), key=lambda c: c[1])
+                print(f"[DEBUG] cols_sorted: {cols_sorted}")
 
                 def col_range(name):
                     for i, (n, x0) in enumerate(cols_sorted):
                         if n == name:
-                            start = x0 - 8
+                            start = x0 - 10
                             end   = (cols_sorted[i + 1][1] - 2
                                      if i + 1 < len(cols_sorted) else 9999)
                             return (start, end)
                     return None
 
-                R_DATE = col_range("DATA")      or (47,   192)
-                R_HIST = col_range("HISTORICO") or (192,  388)
-                R_DOC  = col_range("DOCUMENTO") or (388,  466)
-                R_VAL  = col_range("VALOR")     or (466,  558)
-                # Saldo: tudo acima de R_VAL[1]
+                R_DATE = col_range("DATA")      or (45,   186)
+                R_HIST = col_range("HISTORICO") or (186,  411)
+                R_DOC  = col_range("DOCUMENTO") or (411,  574)
+                R_VAL  = col_range("VALOR")     or (574,  704)
+                # Saldo: x0 >= R_VAL[1]
 
-                # ══════════════════════════════════════════════════
-                # PASSO 2 — Processar cada página
-                # ══════════════════════════════════════════════════
-                for page in pdf.pages:
+                print(f"[DEBUG] R_DATE={R_DATE} R_HIST={R_HIST} "
+                      f"R_DOC={R_DOC} R_VAL={R_VAL}")
+
+                # ══════════════════════════════════════════════════════
+                # PASSO 2 — Processar cada página com extract_words
+                # ══════════════════════════════════════════════════════
+                for page_num, page in enumerate(pdf.pages):
                     words = page.extract_words(
                         x_tolerance=4, y_tolerance=3,
                         keep_blank_chars=False,
@@ -180,6 +189,9 @@ class BankParsers:
                     if not words:
                         continue
 
+                    print(f"\n[DEBUG] Página {page_num + 1}: "
+                          f"{len(words)} palavras extraídas")
+
                     # Agrupa palavras por linha (Y arredondado a 2pt)
                     by_y = defaultdict(list)
                     for w in words:
@@ -187,7 +199,7 @@ class BankParsers:
 
                     sorted_ys = sorted(by_y.keys())
 
-                    # ── Identifica qual coluna cada palavra pertence ──
+                    # Classifica cada palavra na sua coluna
                     def classify(w):
                         x0 = w["x0"]
                         if R_DATE[0] <= x0 < R_DATE[1]:
@@ -203,33 +215,24 @@ class BankParsers:
                         return "OTHER"
 
                     # ── Agrupa linhas em blocos de lançamento ──
-                    # Um bloco começa quando uma linha tem DATE+VAL
-                    # OU quando tem DATE sem VAL (data com hist multilinha).
-                    # Linhas sem DATE e sem VAL são continuação do bloco anterior.
-
-                    blocks = []   # cada bloco = lista de y_keys
+                    # Nova lógica: um bloco começa a cada linha que
+                    # contém uma DATA válida. Linhas sem DATA são
+                    # continuação do bloco anterior (histórico multilinha).
+                    blocks = []
 
                     for y in sorted_ys:
                         row = by_y[y]
-                        cols_present = {classify(w) for w in row}
 
-                        has_date = (
-                            "DATE" in cols_present
-                            and any(
-                                classify(w) == "DATE"
-                                and RE_DATE.match(w["text"])
-                                for w in row
-                            )
+                        has_date = any(
+                            classify(w) == "DATE"
+                            and RE_DATE.match(w["text"])
+                            for w in row
                         )
-                        has_val = (
-                            "VAL" in cols_present
-                            and any(
-                                classify(w) == "VAL"
-                                and RE_VALUE.match(w["text"])
-                                for w in row
-                            )
+                        has_val = any(
+                            classify(w) == "VAL"
+                            and RE_VALUE.match(w["text"])
+                            for w in row
                         )
-                        has_hist = "HIST" in cols_present
 
                         if not blocks:
                             blocks.append([y])
@@ -239,17 +242,13 @@ class BankParsers:
                         last_y     = last_block[-1]
                         gap        = y - last_y
 
-                        # Linha de continuação: perto, sem data, sem valor
-                        is_continuation = (
-                            gap <= 35
-                            and not has_date
-                            and not has_val
-                        )
-
-                        if is_continuation:
-                            last_block.append(y)
-                        else:
+                        # Nova linha de lançamento: tem data própria
+                        # OU gap muito grande (mudança de seção)
+                        if has_date or gap > 60:
                             blocks.append([y])
+                        else:
+                            # Continuação: sem data, perto do bloco anterior
+                            last_block.append(y)
 
                     # ── Processa cada bloco ──
                     for block in blocks:
@@ -267,31 +266,28 @@ class BankParsers:
                             t   = w["text"]
 
                             if col == "DATE":
-                                # Aceita apenas datas reais; ignora flags (a/b/p)
                                 if RE_DATE.match(t):
                                     date_words.append(w)
+                                # flags (a/b/p) → ignora
 
                             elif col == "HIST":
-                                # Ignora tokens que são doc ou valor
                                 if (not RE_DOC.match(t)
                                         and not RE_VALUE.match(t)
                                         and not RE_FLAG.fullmatch(t)):
                                     hist_words.append(w)
 
                             elif col == "DOC":
-                                pass  # ignora
+                                pass  # ignora número do documento
 
                             elif col == "VAL":
                                 if RE_VALUE.match(t):
                                     val_words.append(w)
-
                             # SALDO → ignora
 
-                        # Monta strings
                         date_str = " ".join(
                             w["text"] for w in date_words).strip()
 
-                        # Reconstrói histórico linha a linha (preserva ordem Y)
+                        # Reconstrói histórico linha a linha
                         hist_by_y = defaultdict(list)
                         for w in hist_words:
                             hist_by_y[round(w["top"] / 2) * 2].append(w)
@@ -302,10 +298,16 @@ class BankParsers:
                                 " ".join(w["text"] for w in lw))
                         hist_str = " ".join(hist_lines).strip()
 
-                        # Primeiro valor da coluna VAL = valor do lançamento
-                        # (segundo valor, se existir, é o Saldo)
+                        # Primeiro valor = lançamento; segundo = saldo
                         val_str = (val_words[0]["text"].strip()
                                    if val_words else "")
+
+                        # Debug de cada bloco
+                        if date_str or hist_str or val_str:
+                            print(f"  BLOCO y={block[0]:4d}-{block[-1]:4d} | "
+                                  f"date='{date_str}' | "
+                                  f"hist='{hist_str[:40]}' | "
+                                  f"val='{val_str}'")
 
                         # ── Validações ──
                         if not RE_DATE.match(date_str):
@@ -336,6 +338,8 @@ class BankParsers:
                             "amount":      val,
                             "description": hist_str,
                         })
+
+                print(f"\n[DEBUG] Total de transações: {len(transactions)}")
 
         except Exception:
             import traceback
@@ -485,8 +489,6 @@ class BankParsers:
                 })
         return transactions
 
-
-# ── Mapeamento ────────────────────────────────────────────────────
 
 BANK_MAPPING = {
     "Itaú Unibanco (341)":           (BankParsers.itau,            "341"),
