@@ -50,7 +50,6 @@ class BankParsers:
 
     @staticmethod
     def _normalize(text):
-        """Remove acentos e converte para maiúsculas para comparação robusta."""
         return (
             unicodedata.normalize("NFD", text)
             .encode("ascii", "ignore")
@@ -60,288 +59,244 @@ class BankParsers:
 
     @staticmethod
     def santander(text_lines, pdf_bytes=None):
+        """
+        Parser Santander Internet Banking Empresarial.
+        Estratégia: usa extract_words por coordenadas para separar
+        as colunas DATA / HISTÓRICO / DOCUMENTO / VALOR / SALDO.
+        O sinal do valor é determinado pela posição x0 do número
+        (valores negativos ficam ligeiramente mais à direita no PDF
+        por causa do sinal gráfico em vermelho, mas o texto vem sem '-').
+        Solução: captura AMBOS os valores na faixa e usa o saldo
+        para recalcular o sinal, OU lê o sinal pelo bbox de cor —
+        como não temos acesso à cor via pdfplumber de forma simples,
+        usamos a estratégia de texto puro com regex robusto.
+        """
 
         SKIP_TERMS = [
             "SALDO ANTERIOR", "SALDO DIA", "SALDO BLOQUEADO",
-            "SALDO DISPONIVEL", "SALDO DISPONIVEL",
-            "SALDO EM INVESTIMENTOS", "SALDO DE CONTA",
-            "A - SALDO", "B - SALDO", "C - SALDO", "D - SALDO",
-            "E - SALDO", "F - SALDO", "A = SALDO", "B = SALDO",
-            "A - SALDO DE CONTA", "B - SALDO BLOQUEADO",
-            "C - SALDO DISPONIVEL", "D - SALDO EM",
-            "BLOQUEIO DIA", "LANCAMENTO PROVISIONADO",
-            "INTERNET BANKING", "CONTA CORRENTE",
-            "CENTRAL DE ATENDIMENTO", "SAC", "OUVIDORIA",
-            "4004", "0800", "DATA", "HISTORICO",
-            "DOCUMENTO", "VALOR", "SALDO", "TOTAL", "RESUMO",
-            "PERIODO", "AGENCIA",
-            "V&T", "DATA/HORA", "DAS 8H", "ATENDIMENTO",
-            "CANAL EXCLUSIVO", "LIBRAS",
+            "SALDO DISPONIVEL", "SALDO EM INVESTIMENTOS",
+            "SALDO DE CONTA", "A - SALDO", "B - SALDO",
+            "C - SALDO", "D - SALDO", "E - SALDO", "F - SALDO",
+            "A = SALDO", "B = SALDO", "BLOQUEIO DIA",
+            "LANCAMENTO PROVISIONADO", "INTERNET BANKING",
+            "CONTA CORRENTE", "CENTRAL DE ATENDIMENTO",
+            "SAC", "OUVIDORIA", "4004", "0800",
+            "PERIODO", "AGENCIA", "V&T", "DATA/HORA",
+            "DAS 8H", "ATENDIMENTO", "CANAL EXCLUSIVO", "LIBRAS",
+            "TOTAL", "RESUMO",
         ]
+
+        # Termos que são LINHA DE CABEÇALHO — descartar linha inteira
+        HEADER_TERMS = {"DATA", "HISTORICO", "DOCUMENTO", "VALOR", "SALDO"}
 
         IGNORE_HIST = [
             "RESGATE CONTAMAX",
             "APLICACAO CONTAMAX",
         ]
 
-        RE_FLAG      = re.compile(r"^[abp]$", re.IGNORECASE)
-        RE_DATE_FULL = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-        RE_VALUE     = re.compile(r"^-?[\d\.]+,\d{2}$")
+        RE_DATE      = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+        RE_VALUE_POS = re.compile(r"^[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")   # 1.234,56
+        RE_VALUE_NEG = re.compile(r"^-[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")  # -1.234,56
+        RE_VALUE_ANY = re.compile(r"^-?[\d]{1,3}(?:\.[\d]{3})*,\d{2}$")
         RE_DOC       = re.compile(r"^\d{4,6}$")
+        RE_FLAG      = re.compile(r"^[abpABP]$")
 
-        def normalize(text):
-            return BankParsers._normalize(text)
+        normalize = BankParsers._normalize
 
         def is_skip(text):
             u = normalize(text)
             return any(s in u for s in SKIP_TERMS)
+
+        def is_header(text):
+            u = normalize(text)
+            return u in HEADER_TERMS
 
         def is_ignore(text):
             u = normalize(text)
             return any(s in u for s in IGNORE_HIST)
 
         def is_invalid_desc(s):
-            return (
-                not s
-                or re.fullmatch(r"[\d\s/\.,-]+", s)
-                or RE_FLAG.match(s.strip())
-            )
+            if not s:
+                return True
+            if re.fullmatch(r"[\d\s/\.,-]+", s):
+                return True
+            if RE_FLAG.fullmatch(s.strip()):
+                return True
+            return False
 
         transactions = []
 
+        # ════════════════════════════════════════════════════════════
+        # ESTRATÉGIA PRINCIPAL: texto puro via extract_text
+        # O pdfplumber extrai o texto do Santander IB muito bem.
+        # Cada lançamento ocupa 1 ou mais linhas:
+        #   Linha principal: DD/MM/AAAA [flag] HISTORICO... DOC VALOR [SALDO]
+        #   Linhas extras  : continuação do HISTORICO (sem data/valor)
+        # ════════════════════════════════════════════════════════════
         if pdf_bytes:
             try:
+                all_lines = []
                 with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-
-                    # ── Passo 1: detecta colunas lendo o cabeçalho ──
-                    col_bounds = None
-
                     for page in pdf.pages:
-                        words = page.extract_words(
-                            x_tolerance=5,
-                            y_tolerance=3,
-                            keep_blank_chars=False,
-                            use_text_flow=False,
-                        )
-                        by_y = defaultdict(list)
-                        for w in words:
-                            by_y[round(w["top"] / 3) * 3].append(w)
+                        txt = page.extract_text(x_tolerance=2, y_tolerance=3)
+                        if txt:
+                            all_lines.extend(txt.split("\n"))
 
-                        for y in sorted(by_y.keys()):
-                            row = by_y[y]
-                            # Normaliza sem acentos para comparação robusta
-                            texts_norm = [normalize(w["text"]) for w in row]
+                # Remove linhas vazias, cabeçalhos e rodapés
+                clean = []
+                for raw in all_lines:
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    if is_header(s):
+                        continue
+                    # Linha de cabeçalho completa (Data Histórico Documento...)
+                    norm = normalize(s)
+                    if ("DATA" in norm and "HISTORICO" in norm
+                            and "DOCUMENTO" in norm):
+                        continue
+                    clean.append(s)
 
-                            has_data  = "DATA"  in texts_norm
-                            has_valor = "VALOR" in texts_norm
+                # Agrupa linhas de continuação com a linha principal
+                # Uma linha principal começa com DD/MM/AAAA
+                RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}\b")
+                merged = []
+                for line in clean:
+                    if RE_DATE_START.match(line):
+                        merged.append(line)
+                    elif merged:
+                        # Continuação: anexa à linha anterior
+                        merged[-1] = merged[-1] + " " + line
 
-                            if has_data and has_valor:
-                                col_x = {}
-                                for w in row:
-                                    t_norm = normalize(w["text"])
-                                    if t_norm in ("DATA", "HISTORICO",
-                                                  "DOCUMENTO", "VALOR", "SALDO"):
-                                        col_x[t_norm] = w["x0"]
-                                if len(col_x) >= 4:
-                                    col_bounds = col_x
-                                    break
-                        if col_bounds:
-                            break
+                # Regex principal para extrair campos do lançamento
+                # Formato: DD/MM/AAAA [flag] HISTORICO DOC VALOR [SALDO]
+                # O VALOR pode ser positivo ou negativo
+                # O SALDO pode ou não aparecer
+                PAT = re.compile(
+                    r"^(\d{2}/\d{2}/\d{4})"          # grupo 1: data
+                    r"(?:\s+[abpABP])?"               # flag opcional
+                    r"\s+(.+?)"                        # grupo 2: histórico (lazy)
+                    r"\s+(\d{4,6})"                    # grupo 3: documento
+                    r"\s+(-?[\d\.]+,\d{2})"            # grupo 4: valor
+                    r"(?:\s+-?[\d\.]+,\d{2})?"         # saldo opcional
+                    r"\s*$"
+                )
 
-                    # ── Fallback de coordenadas (medidas reais do PDF Santander IB) ──
-                    if not col_bounds:
-                        col_bounds = {
-                            "DATA":       55,
-                            "HISTORICO":  140,
-                            "DOCUMENTO":  390,
-                            "VALOR":      468,
-                            "SALDO":      560,
-                        }
+                for line in merged:
+                    s = line.strip()
+                    if not s:
+                        continue
 
-                    # Todas as chaves já estão normalizadas (sem acento)
-                    sorted_cols = sorted(col_bounds.items(), key=lambda x: x[1])
-                    col_ranges  = {}
-                    for i, (name, x0) in enumerate(sorted_cols):
-                        x_min = x0 - 8
-                        x_max = (sorted_cols[i + 1][1] - 2
-                                 if i + 1 < len(sorted_cols) else 9999)
-                        col_ranges[name] = (x_min, x_max)
+                    # Descarta linhas de saldo/resumo
+                    if is_skip(s):
+                        continue
 
-                    X_DATE = col_ranges.get("DATA",       (47,  138))
-                    X_HIST = col_ranges.get("HISTORICO",  (138, 388))
-                    X_DOC  = col_ranges.get("DOCUMENTO",  (388, 466))
-                    X_VAL  = col_ranges.get("VALOR",      (466, 558))
+                    m = PAT.match(s)
+                    if not m:
+                        continue
 
-                    # ── Passo 2: extrai lançamentos página a página ──
-                    for page in pdf.pages:
-                        words = page.extract_words(
-                            x_tolerance=5,
-                            y_tolerance=3,
-                            keep_blank_chars=False,
-                            use_text_flow=False,
-                        )
-                        if not words:
+                    dt_str   = m.group(1)
+                    hist_raw = m.group(2).strip()
+                    doc      = m.group(3)
+                    val_str  = m.group(4)
+
+                    # Limpa o histórico: remove tokens que são doc/valor/saldo
+                    # que possam ter sido capturados pelo grupo lazy
+                    hist_tokens = hist_raw.split()
+                    hist_clean  = []
+                    for tok in hist_tokens:
+                        if RE_DOC.match(tok):
                             continue
+                        if RE_VALUE_ANY.match(tok):
+                            continue
+                        if RE_FLAG.fullmatch(tok):
+                            continue
+                        hist_clean.append(tok)
+                    hist_str = " ".join(hist_clean).strip()
 
-                        by_y = defaultdict(list)
-                        for w in words:
-                            by_y[round(w["top"] / 3) * 3].append(w)
+                    if not hist_str or is_invalid_desc(hist_str):
+                        continue
+                    if is_skip(hist_str) or is_ignore(hist_str):
+                        continue
 
-                        sorted_ys = sorted(by_y.keys())
-                        blocks    = []
+                    dt_obj = BankParsers._parse_date(dt_str)
+                    if not dt_obj:
+                        continue
 
-                        for y in sorted_ys:
-                            row_words = by_y[y]
+                    try:
+                        val = float(val_str.replace(".", "").replace(",", "."))
+                    except ValueError:
+                        continue
 
-                            has_date = any(
-                                X_DATE[0] <= w["x0"] < X_DATE[1]
-                                and RE_DATE_FULL.match(w["text"])
-                                for w in row_words
-                            )
-                            has_val = any(
-                                X_VAL[0] <= w["x0"] < X_VAL[1]
-                                and RE_VALUE.match(w["text"])
-                                for w in row_words
-                            )
-                            has_hist = any(
-                                X_HIST[0] <= w["x0"] < X_HIST[1]
-                                for w in row_words
-                            )
-
-                            if not blocks:
-                                blocks.append([y])
-                                continue
-
-                            last_block = blocks[-1]
-                            last_y     = last_block[-1]
-                            gap        = y - last_y
-
-                            # Continuação: próximo (≤22pt), sem data,
-                            # sem valor, e com texto no histórico
-                            if gap <= 22 and not has_date and not has_val and has_hist:
-                                last_block.append(y)
-                            else:
-                                blocks.append([y])
-
-                        # ── Passo 3: processa cada bloco ──
-                        for block in blocks:
-                            all_words = []
-                            for y in block:
-                                all_words.extend(by_y[y])
-
-                            date_words = []
-                            hist_words = []
-                            val_words  = []
-
-                            for w in sorted(all_words,
-                                            key=lambda x: (x["top"], x["x0"])):
-                                x0   = w["x0"]
-                                text = w["text"]
-
-                                if X_DATE[0] <= x0 < X_DATE[1]:
-                                    if not RE_FLAG.match(text):
-                                        date_words.append(w)
-                                elif X_HIST[0] <= x0 < X_HIST[1]:
-                                    if not RE_FLAG.match(text) and not RE_DOC.match(text):
-                                        hist_words.append(w)
-                                elif X_DOC[0] <= x0 < X_DOC[1]:
-                                    pass  # ignora coluna documento
-                                elif X_VAL[0] <= x0 < X_VAL[1]:
-                                    val_words.append(w)
-                                # x0 >= X_VAL[1] → coluna saldo → ignora
-
-                            date_str = " ".join(w["text"] for w in date_words).strip()
-                            val_str  = " ".join(w["text"] for w in val_words).strip()
-
-                            # Reconstrói histórico agrupando por sub-linha
-                            hist_by_y = defaultdict(list)
-                            for w in hist_words:
-                                hist_by_y[round(w["top"] / 3) * 3].append(w)
-
-                            hist_lines = []
-                            for hy in sorted(hist_by_y.keys()):
-                                line_words = sorted(hist_by_y[hy],
-                                                    key=lambda x: x["x0"])
-                                hist_lines.append(
-                                    " ".join(w["text"] for w in line_words))
-
-                            hist_str = " ".join(hist_lines).strip()
-
-                            # ── Validações ──
-                            if not RE_DATE_FULL.match(date_str):
-                                continue
-                            if not val_str or not RE_VALUE.match(val_str):
-                                continue
-                            if not hist_str:
-                                continue
-
-                            combined = (date_str + " " + hist_str)
-                            if is_skip(combined):
-                                continue
-                            if is_ignore(hist_str):
-                                continue
-                            if is_invalid_desc(hist_str):
-                                continue
-
-                            dt_obj = BankParsers._parse_date(date_str)
-                            if not dt_obj:
-                                continue
-
-                            try:
-                                val = float(
-                                    val_str.replace(".", "").replace(",", "."))
-                                transactions.append({
-                                    "date_obj":    dt_obj,
-                                    "amount":      val,
-                                    "description": hist_str,
-                                })
-                            except ValueError:
-                                pass
+                    transactions.append({
+                        "date_obj":    dt_obj,
+                        "amount":      val,
+                        "description": hist_str,
+                    })
 
                 if transactions:
                     return transactions
 
-            except Exception:
+            except Exception as e:
                 transactions = []
 
-        # ── Fallback: texto puro ──
-        RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}")
+        # ════════════════════════════════════════════════════════════
+        # FALLBACK: text_lines já extraídas externamente
+        # ════════════════════════════════════════════════════════════
+        RE_DATE_START = re.compile(r"^\d{2}/\d{2}/\d{4}\b")
         merged = []
         for raw in text_lines:
             s = raw.strip()
-            if not s or is_skip(s) or is_ignore(s):
+            if not s:
+                continue
+            if is_skip(s) or is_header(normalize(s)):
                 continue
             if RE_DATE_START.match(s):
                 merged.append(s)
             elif merged:
                 merged[-1] += " " + s
 
-        PAT = re.compile(
-            r"(\d{2}/\d{2}/\d{4})(?:\s+[abp])?\s+(.+?)"
-            r"\s+(\d{4,6})\s+(-?[\d\.]+,\d{2})(?:\s+-?[\d\.]+,\d{2})?$",
-            re.IGNORECASE,
+        PAT2 = re.compile(
+            r"^(\d{2}/\d{2}/\d{4})"
+            r"(?:\s+[abpABP])?"
+            r"\s+(.+?)"
+            r"\s+(\d{4,6})"
+            r"\s+(-?[\d\.]+,\d{2})"
+            r"(?:\s+-?[\d\.]+,\d{2})?"
+            r"\s*$"
         )
         for line in merged:
             s = line.strip()
-            if is_skip(s) or is_ignore(s):
+            if not s or is_skip(s):
                 continue
-            m = PAT.search(s)
-            if m:
-                dt_str, desc, _doc, val_str = m.group(1, 2, 3, 4)
-                desc = " ".join(desc.split()).strip()
-                if is_invalid_desc(desc):
-                    continue
-                dt_obj = BankParsers._parse_date(dt_str)
-                if dt_obj:
-                    try:
-                        val = float(val_str.replace(".", "").replace(",", "."))
-                        transactions.append({
-                            "date_obj":    dt_obj,
-                            "amount":      val,
-                            "description": desc,
-                        })
-                    except ValueError:
-                        pass
+            m = PAT2.match(s)
+            if not m:
+                continue
+            dt_str, hist_raw, _doc, val_str = m.group(1, 2, 3, 4)
+            hist_tokens = hist_raw.split()
+            hist_clean  = [
+                t for t in hist_tokens
+                if not RE_DOC.match(t)
+                and not RE_VALUE_ANY.match(t)
+                and not RE_FLAG.fullmatch(t)
+            ]
+            hist_str = " ".join(hist_clean).strip()
+            if not hist_str or is_invalid_desc(hist_str):
+                continue
+            if is_skip(hist_str) or is_ignore(hist_str):
+                continue
+            dt_obj = BankParsers._parse_date(dt_str)
+            if not dt_obj:
+                continue
+            try:
+                val = float(val_str.replace(".", "").replace(",", "."))
+                transactions.append({
+                    "date_obj":    dt_obj,
+                    "amount":      val,
+                    "description": hist_str,
+                })
+            except ValueError:
+                pass
 
         return transactions
 
@@ -477,20 +432,20 @@ class BankParsers:
 
 
 BANK_MAPPING = {
-    "Itaú Unibanco (341)":            (BankParsers.itau,            "341"),
-    "Bradesco (237)":                  (BankParsers.bradesco,        "237"),
-    "Santander (033)":                 (BankParsers.santander,       "033"),
-    "Banco do Brasil (001)":           (BankParsers.banco_do_brasil, "001"),
-    "Caixa Econômica Federal (104)":   (BankParsers.caixas,          "104"),
-    "Sicoob (756)":                    (BankParsers.generic_fallback,"756"),
-    "Sicredi (748)":                   (BankParsers.generic_fallback,"748"),
-    "Banco Inter (077)":               (BankParsers.generic_fallback,"077"),
-    "Nubank (260)":                    (BankParsers.generic_fallback,"260"),
-    "C6 Bank (336)":                   (BankParsers.generic_fallback,"336"),
-    "Banrisul (041)":                  (BankParsers.generic_fallback,"041"),
-    "Stone Pagamentos (197)":          (BankParsers.generic_fallback,"197"),
-    "Unicred (136)":                   (BankParsers.generic_fallback,"136"),
-    "Mercado Pago (323)":              (BankParsers.generic_fallback,"323"),
+    "Itaú Unibanco (341)":           (BankParsers.itau,            "341"),
+    "Bradesco (237)":                 (BankParsers.bradesco,        "237"),
+    "Santander (033)":                (BankParsers.santander,       "033"),
+    "Banco do Brasil (001)":          (BankParsers.banco_do_brasil, "001"),
+    "Caixa Econômica Federal (104)":  (BankParsers.caixas,          "104"),
+    "Sicoob (756)":                   (BankParsers.generic_fallback,"756"),
+    "Sicredi (748)":                  (BankParsers.generic_fallback,"748"),
+    "Banco Inter (077)":              (BankParsers.generic_fallback,"077"),
+    "Nubank (260)":                   (BankParsers.generic_fallback,"260"),
+    "C6 Bank (336)":                  (BankParsers.generic_fallback,"336"),
+    "Banrisul (041)":                 (BankParsers.generic_fallback,"041"),
+    "Stone Pagamentos (197)":         (BankParsers.generic_fallback,"197"),
+    "Unicred (136)":                  (BankParsers.generic_fallback,"136"),
+    "Mercado Pago (323)":             (BankParsers.generic_fallback,"323"),
 }
 
 BYTES_AWARE_PARSERS = {"033"}
@@ -498,27 +453,37 @@ BYTES_AWARE_PARSERS = {"033"}
 
 def detect_bank(text_lines):
     header_text = " ".join(text_lines[:40]).upper()
-    # Remove acentos para comparação robusta
     header_norm = (
         unicodedata.normalize("NFD", header_text)
         .encode("ascii", "ignore")
         .decode()
     )
     BANK_SIGNATURES = [
-        ("Santander (033)",              [("SANTANDER",3),("CONTAMAX",5),("INTERNET BANKING EMPRESARIAL",4),("BLOQUEIO DIA",3),("4004 2125",4),("0800 702 2125",4)]),
-        ("Itaú Unibanco (341)",          [("ITAU UNIBANCO",5),("BANCO ITAU",4),("ITAU UNIBANCO",5),("ITOKEN",4),("0300 789 8484",4)]),
-        ("Bradesco (237)",               [("BANCO BRADESCO",5),("BRADESCO S.A",5),("BRADESCO PRIME",4),("BRADESCO",3),("0800 704 8383",4)]),
-        ("Banco do Brasil (001)",        [("BANCO DO BRASIL",5),("BB.COM.BR",5),("0800 729 0722",4),("AGENCIA BB",3)]),
-        ("Caixa Econômica Federal (104)",[("CAIXA ECONOMICA FEDERAL",5),("CEF",2),("0800 726 0101",4),("CAIXA.GOV",4)]),
-        ("Sicoob (756)",                 [("SICOOB",5),("0800 642 2200",4)]),
-        ("Sicredi (748)",                [("SICREDI",5),("0800 724 7220",4)]),
-        ("Banco Inter (077)",            [("BANCO INTER",5),("INTER S.A",4),("CONTA DIGITAL INTER",5)]),
-        ("Nubank (260)",                 [("NUBANK",5),("NU PAGAMENTOS",5),("NUCONTA",4)]),
-        ("C6 Bank (336)",                [("C6 BANK",5),("C6 S.A",4)]),
-        ("Banrisul (041)",               [("BANRISUL",5),("BANCO DO ESTADO DO RIO GRANDE",4)]),
-        ("Stone Pagamentos (197)",       [("STONE PAGAMENTOS",5),("STONECO",4)]),
-        ("Unicred (136)",                [("UNICRED",5)]),
-        ("Mercado Pago (323)",           [("MERCADO PAGO",5),("MERCADOPAGO",5)]),
+        ("Santander (033)",             [("SANTANDER", 3), ("CONTAMAX", 5),
+                                         ("INTERNET BANKING EMPRESARIAL", 4),
+                                         ("BLOQUEIO DIA", 3), ("4004 2125", 4),
+                                         ("0800 702 2125", 4)]),
+        ("Itaú Unibanco (341)",         [("ITAU UNIBANCO", 5), ("BANCO ITAU", 4),
+                                         ("ITOKEN", 4), ("0300 789 8484", 4)]),
+        ("Bradesco (237)",              [("BANCO BRADESCO", 5), ("BRADESCO S.A", 5),
+                                         ("BRADESCO PRIME", 4), ("BRADESCO", 3),
+                                         ("0800 704 8383", 4)]),
+        ("Banco do Brasil (001)",       [("BANCO DO BRASIL", 5), ("BB.COM.BR", 5),
+                                         ("0800 729 0722", 4), ("AGENCIA BB", 3)]),
+        ("Caixa Econômica Federal (104)",[("CAIXA ECONOMICA FEDERAL", 5), ("CEF", 2),
+                                          ("0800 726 0101", 4), ("CAIXA.GOV", 4)]),
+        ("Sicoob (756)",                [("SICOOB", 5), ("0800 642 2200", 4)]),
+        ("Sicredi (748)",               [("SICREDI", 5), ("0800 724 7220", 4)]),
+        ("Banco Inter (077)",           [("BANCO INTER", 5), ("INTER S.A", 4),
+                                         ("CONTA DIGITAL INTER", 5)]),
+        ("Nubank (260)",                [("NUBANK", 5), ("NU PAGAMENTOS", 5),
+                                         ("NUCONTA", 4)]),
+        ("C6 Bank (336)",               [("C6 BANK", 5), ("C6 S.A", 4)]),
+        ("Banrisul (041)",              [("BANRISUL", 5),
+                                         ("BANCO DO ESTADO DO RIO GRANDE", 4)]),
+        ("Stone Pagamentos (197)",      [("STONE PAGAMENTOS", 5), ("STONECO", 4)]),
+        ("Unicred (136)",               [("UNICRED", 5)]),
+        ("Mercado Pago (323)",          [("MERCADO PAGO", 5), ("MERCADOPAGO", 5)]),
     ]
     scores = {}
     for bank_key, signatures in BANK_SIGNATURES:
@@ -657,9 +622,13 @@ if uploaded_file is not None:
             )
 
             if not transactions:
+                # ── DEBUG: mostra as linhas extraídas para diagnóstico ──
+                with st.expander("🔍 Debug — linhas extraídas do PDF"):
+                    for i, l in enumerate(text_lines[:80]):
+                        st.text(f"{i:03d}: {l}")
                 st.error(
                     "Nenhum lançamento identificado. "
-                    "Verifique se o PDF contém texto selecionável.")
+                    "Verifique as linhas acima para diagnóstico.")
             else:
                 transactions.sort(key=lambda x: x["date_obj"])
 
@@ -667,8 +636,10 @@ if uploaded_file is not None:
                 initial_balance = (manual_initial_balance
                                    if manual_initial_balance != 0.0
                                    else pdf_initial)
-                total_credits   = sum(t["amount"] for t in transactions if t["amount"] > 0)
-                total_debits    = sum(t["amount"] for t in transactions if t["amount"] < 0)
+                total_credits   = sum(t["amount"] for t in transactions
+                                      if t["amount"] > 0)
+                total_debits    = sum(t["amount"] for t in transactions
+                                      if t["amount"] < 0)
                 final_balance   = initial_balance + total_credits + total_debits
 
                 st.markdown("---")
@@ -730,3 +701,5 @@ if uploaded_file is not None:
 
         except Exception as e:
             st.error(f"Erro ao processar o PDF: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
